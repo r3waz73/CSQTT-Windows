@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- WebView2 ships both WinForms and WPF adapters; this project consumes only WinForms. -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <AssemblyName>CSQTT.Windows</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4129.50" />
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
+    <None Include="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="README.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="DEVELOPMENT_GUIDE.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="native\wintun.dll" Link="wintun.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('native\wintun.dll')" />
+    <None Include="Core\rust-client\target\release\client.exe" Link="client.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('Core\rust-client\target\release\client.exe')" />
+    <Content Include="Assets\deploy.sh" Link="Assets\deploy.sh" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Linux-сервер лежит рядом с EXE: пакет можно перенести на другой ПК,
+         а Deploy UI найдёт бинарник через AppContext.BaseDirectory. -->
+    <Content Include="Assets\csqtt" Link="csqtt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

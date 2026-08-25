@@ -121,8 +121,10 @@ struct Args {
 struct DeployOverrides {
     #[serde(default)]
     main_password: String,
+    // None означает, что deploy не управляет привязкой. Some("") — явная
+    // команда очистить прежнюю привязку главного пароля.
     #[serde(default)]
-    device_id: String,
+    device_id: Option<String>,
     #[serde(default)]
     dns: String,
 }
@@ -1291,8 +1293,8 @@ async fn main() -> Result<()> {
     }
     if !args.device_id.is_empty() {
         db.main_device_id = args.device_id.clone();
-    } else if !deploy_overrides.device_id.is_empty() {
-        db.main_device_id = deploy_overrides.device_id.clone();
+    } else if let Some(device_id) = deploy_overrides.device_id.as_ref() {
+        db.main_device_id = device_id.clone();
     }
     if db.main_password.is_empty() {
         db.main_password = random_password() + &random_password();

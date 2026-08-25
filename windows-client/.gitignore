@@ -1,0 +1,8 @@
+bin/
+obj/
+publish/
+native/
+Core/rust-client/target/
+.dotnet-cli/
+.nuget-packages/
+*.user
