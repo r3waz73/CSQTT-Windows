@@ -25,7 +25,8 @@ internal sealed class MainForm : Form
     private readonly TunnelController tunnel = new();
     private readonly TextBox link = Input(), peer = Input(), hashes = Input(true), password = Input(), turn = Input(), turnPort = Input(), ids = Input();
     private readonly ThemedLogView logs = new(200), deployLogs = new(500);
-    private readonly NumericUpDown workers = new();
+    private readonly DarkWorkerSlider workers = new();
+    private readonly Label workersValue = new() { ForeColor = TextMain, Font = new("Segoe UI Semibold", 10), TextAlign = ContentAlignment.MiddleRight };
     private readonly ComboBox obfs = SelectInput(), turnTransport = SelectInput(), fingerprint = SelectInput(), auth = SelectInput(), captcha = SelectInput();
     private readonly ComboBox vkMode = SelectInput(), deployMode = SelectInput();
     private readonly ComboBox logDetail = SelectInput();
@@ -47,7 +48,7 @@ internal sealed class MainForm : Form
     {
         // Конструктор строит дерево WinForms-контролов программно. Для небольшого
         // учебного проекта это удобнее Designer.cs и уменьшает число файлов.
-        Text = "CSQTT for Windows 3.13";
+        Text = "CSQTT for Windows 3.13.1";
         Width = 1080; Height = 760; MinimumSize = new(900, 650); StartPosition = FormStartPosition.CenterScreen;
         BackColor = Background; ForeColor = TextMain; Font = new("Segoe UI", 10); DoubleBuffered = true;
 
@@ -92,7 +93,7 @@ internal sealed class MainForm : Form
         connectionNav.Dock = DockStyle.Top; connectionNav.Height = 48; connectionNav.Margin = new(0, 8, 0, 0);
         logNav.Dock = DockStyle.Top; logNav.Height = 48;
         deployNav.Dock = DockStyle.Top; deployNav.Height = 48;
-        var license = new Label { Text = "CSQTT 2.1.9\nWindows client 3.13", ForeColor = TextMuted, Dock = DockStyle.Bottom, Height = 48 };
+        var license = new Label { Text = "CSQTT 2.1.9\nWindows client 3.13.1", ForeColor = TextMuted, Dock = DockStyle.Bottom, Height = 48 };
         // DockStyle.Top располагает элементы в обратном порядке добавления.
         // Поэтому deploy добавляется раньше log и визуально оказывается ниже.
         side.Controls.Add(license); side.Controls.Add(deployNav); side.Controls.Add(logNav); side.Controls.Add(connectionNav); side.Controls.Add(subtitle); side.Controls.Add(logo);
@@ -132,7 +133,12 @@ internal sealed class MainForm : Form
         AddField(fields, "Аккаунт VK", vkPanel, "Токен хранится зашифрованно в Windows");
         AddField(fields, "VK-хеши", hashes, "До шести хешей, разделённых запятой");
         password.UseSystemPasswordChar = true; AddField(fields, "Пароль", password, "Хранится зашифрованно средствами Windows");
-        AddField(fields, "Воркеров на хеш", workers, "9 — рекомендуемое значение");
+        var workersRow = new TableLayoutPanel { Dock = DockStyle.Top, Height = 42, ColumnCount = 2 };
+        workersRow.ColumnStyles.Add(new(SizeType.Percent, 100)); workersRow.ColumnStyles.Add(new(SizeType.Absolute, 105));
+        workers.Dock = DockStyle.Fill; workersValue.Dock = DockStyle.Fill;
+        workers.ValueChanged += (_, _) => workersValue.Text = $"{workers.Value} потоков";
+        workersRow.Controls.Add(workers, 0, 0); workersRow.Controls.Add(workersValue, 1, 0);
+        AddField(fields, "Количество потоков", workersRow, "От 9 до 108, шаг 9; в ручном режиме предел зависит от числа хешей");
         main.Controls.Add(fields); cards.Controls.Add(main);
 
         var advanced = Card("Дополнительные настройки", "Меняйте их только если соответствующие параметры заданы на Android.");
@@ -194,7 +200,8 @@ internal sealed class MainForm : Form
         // UI заполняется только после создания всех контролов. Значения ComboBox
         // нормализуются по списку допустимых вариантов.
         link.Text = cfg.GetLink(); peer.Text = cfg.Peer; hashes.Text = cfg.VkHashes; password.Text = cfg.GetPassword(); turn.Text = cfg.TurnHost; turnPort.Text = cfg.TurnPort; ids.Text = cfg.ClientIds;
-        workers.Minimum = 9; workers.Maximum = 27; workers.Increment = 9; workers.Value = Math.Clamp(cfg.WorkersPerHash, 9, 27); StyleNumeric(workers);
+        workers.Value = cfg.WorkerCount;
+        workersValue.Text = $"{workers.Value} потоков";
         Fill(turnTransport, ["udp", "tcp_tls"], cfg.TurnTransport); Fill(obfs, ["video", "audio"], cfg.Obfs); Fill(fingerprint, ["firefox", "chrome", "edge", "safari", "opera"], cfg.Fingerprint); Fill(auth, ["vkcalls", "legacy"], cfg.VkAuthMode); Fill(captcha, ["auto", "manual"], cfg.CaptchaMode);
         Fill(vkMode, ["Автоматически (VK)", "Вручную"], cfg.VkHashMode == "auto_js" ? "Автоматически (VK)" : "Вручную");
         vkMode.SelectedIndexChanged += (_, _) => UpdateVkControls(); UpdateVkControls();
@@ -247,7 +254,7 @@ internal sealed class MainForm : Form
     {
         // Секреты передаются отдельно: ClientConfig.SetSecrets шифрует их перед
         // сериализацией JSON.
-        cfg.Peer = peer.Text.Trim(); cfg.VkHashes = hashes.Text.Trim(); cfg.VkHashMode = vkMode.SelectedIndex == 0 ? "auto_js" : "manual"; cfg.TurnHost = turn.Text.Trim(); cfg.TurnPort = turnPort.Text.Trim(); cfg.WorkersPerHash = (int)workers.Value; cfg.TurnTransport = turnTransport.Text; cfg.Obfs = obfs.Text; cfg.Fingerprint = fingerprint.Text; cfg.ClientIds = ids.Text; cfg.VkAuthMode = auth.Text; cfg.CaptchaMode = captcha.Text; cfg.LogLevel = logDetail.Text;
+        cfg.Peer = peer.Text.Trim(); cfg.VkHashes = hashes.Text.Trim(); cfg.VkHashMode = vkMode.SelectedIndex == 0 ? "auto_js" : "manual"; cfg.TurnHost = turn.Text.Trim(); cfg.TurnPort = turnPort.Text.Trim(); cfg.WorkerCount = workers.Value; cfg.TurnTransport = turnTransport.Text; cfg.Obfs = obfs.Text; cfg.Fingerprint = fingerprint.Text; cfg.ClientIds = ids.Text; cfg.VkAuthMode = auth.Text; cfg.CaptchaMode = captcha.Text; cfg.LogLevel = logDetail.Text;
         var d = cfg.Deploy; d.Host = deployHost.Text.Trim(); d.User = deployUser.Text.Trim(); d.SshPort = ParsePort(deploySshPort.Text, d.SshPort, "SSH-порт", requireValidDeployPorts); d.PrivateKeyPath = deployKey.Text.Trim(); d.ServerBinaryPath = deployBinary.Text.Trim(); d.Mode = deployMode.Text; d.PeerPort = ParsePort(deployPeerPort.Text, d.PeerPort, "Peer-порт", requireValidDeployPorts); d.WebPort = ParsePort(deployWebPort.Text, d.WebPort, "Web-порт", requireValidDeployPorts); d.WebLogin = deployWebLogin.Text.Trim(); d.BindMainPasswordToThisDevice = deployBindDevice.Checked; d.SetSecrets(deploySshPassword.Text, deployKeyPass.Text, deployMainPassword.Text, deployWebPassword.Text);
         cfg.SetSecrets(link.Text.Trim(), password.Text); cfg.Save();
     }
@@ -362,7 +369,76 @@ internal sealed class MainForm : Form
     private static Button Button(string text, Color color) { var button = new ThemeButton { Text = text, BackColor = color, ForeColor = TextMain, FlatStyle = FlatStyle.Flat, Height = 40, Cursor = Cursors.Hand, Font = new("Segoe UI Semibold", 10), UseVisualStyleBackColor = false }; button.FlatAppearance.BorderSize = 0; button.FlatAppearance.MouseOverBackColor = color == Color.Transparent ? Surface2 : ControlPaint.Light(color, .08f); button.FlatAppearance.MouseDownBackColor = color == Color.Transparent ? Color.FromArgb(45, 50, 72) : ControlPaint.Dark(color, .08f); return button; }
     private static Button NavButton(string text) { var button = Button(text, Color.Transparent); button.TextAlign = ContentAlignment.MiddleLeft; button.Padding = new(14, 0, 0, 0); button.TabStop = false; return button; }
     private static void Fill(ComboBox box, string[] values, string selected) { box.Items.AddRange(values); box.SelectedItem = values.Contains(selected) ? selected : values[0]; }
-    private static void StyleNumeric(NumericUpDown box) { box.BackColor = Surface2; box.ForeColor = TextMain; box.BorderStyle = BorderStyle.FixedSingle; box.Height = 34; }
+
+    /// <summary>
+    /// Тёмный owner-drawn ползунок. Значение всегда кратно девяти, поэтому в
+    /// конфигурацию и аргументы Rust-процесса невозможно записать полугруппу.
+    /// </summary>
+    private sealed class DarkWorkerSlider : Control
+    {
+        private const int Minimum = 9, Maximum = 108, Step = 9;
+        private int value = 18;
+        public event EventHandler? ValueChanged;
+        [System.ComponentModel.DefaultValue(18)]
+        public int Value
+        {
+            get => value;
+            set
+            {
+                int normalized = Math.Clamp(value, Minimum, Maximum) / Step * Step;
+                if (this.value == normalized) return;
+                this.value = normalized;
+                Invalidate();
+                ValueChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        public DarkWorkerSlider()
+        {
+            Height = 38;
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            int left = 10, right = Math.Max(left + 1, ClientSize.Width - 10), y = ClientSize.Height / 2;
+            float progress = (Value - Minimum) / (float)(Maximum - Minimum);
+            int thumbX = left + (int)Math.Round((right - left) * progress);
+            using var track = new Pen(Surface2, 7) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            using var filled = new Pen(Enabled ? Accent : TextMuted, 7) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            e.Graphics.DrawLine(track, left, y, right, y);
+            e.Graphics.DrawLine(filled, left, y, thumbX, y);
+            using var thumb = new SolidBrush(Enabled ? Color.FromArgb(139, 142, 255) : TextMuted);
+            e.Graphics.FillEllipse(thumb, thumbX - 9, y - 9, 18, 18);
+            if (Focused)
+                ControlPaint.DrawFocusRectangle(e.Graphics, new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3)), Accent, Background);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); Focus(); Capture = true; SetFromPointer(e.X); }
+        protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); if (Capture && e.Button == MouseButtons.Left) SetFromPointer(e.X); }
+        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); Capture = false; }
+        protected override void OnMouseWheel(MouseEventArgs e) { base.OnMouseWheel(e); Value += Math.Sign(e.Delta) * Step; }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode is Keys.Left or Keys.Down) { Value -= Step; e.Handled = true; }
+            else if (e.KeyCode is Keys.Right or Keys.Up) { Value += Step; e.Handled = true; }
+            else if (e.KeyCode == Keys.Home) { Value = Minimum; e.Handled = true; }
+            else if (e.KeyCode == Keys.End) { Value = Maximum; e.Handled = true; }
+        }
+
+        private void SetFromPointer(int x)
+        {
+            int width = Math.Max(1, ClientSize.Width - 20);
+            double position = Math.Clamp(x - 10, 0, width) / (double)width;
+            Value = Minimum + (int)Math.Round(position * ((Maximum - Minimum) / Step)) * Step;
+        }
+    }
 
     private class RoundedPanel : Panel
     {

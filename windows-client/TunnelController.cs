@@ -110,11 +110,10 @@ internal sealed partial class TunnelController : IAsyncDisposable
 
     private string BuildArgs(ClientConfig c, string password, int port)
     {
-        // Сервер ожидает воркеры группами по 9. Итоговое число зависит от
-        // количества хешей, но никогда не должно быть меньше одной группы.
+        // Сервер ожидает воркеры группами по 9. UI хранит именно итоговое число,
+        // как актуальный Android-клиент; дополнительного умножения на хеши нет.
         bool autoVk = c.VkHashMode == "auto_js";
-        int hashes = c.VkHashes.Split([',', ' ', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Take(6).Count();
-        int workers = autoVk ? Math.Clamp(c.AutoWorkers, 9, 54) : Math.Max(9, c.WorkersPerHash) * Math.Max(1, hashes);
+        int workers = Math.Clamp(c.WorkerCount, 9, 108) / 9 * 9;
         var a = new List<string> { "-peer", c.Peer, "-n", workers.ToString(), "-listen", $"127.0.0.1:{port}", "-fingerprint", c.Fingerprint, "-client-ids", c.ClientIds, "-obfs", c.Obfs, "-turn-transport", c.TurnTransport, "-vk-auth-mode", autoVk ? "auto_js" : c.VkAuthMode, "-vk-hash-mode", autoVk ? "auto_js" : "manual", "-device-id", c.DeviceId, "-password", password, "-captcha-mode", c.CaptchaMode };
         if (autoVk) a.Add("--allow-hash-redistribution");
         else { a.Add("-vk"); a.Add(c.VkHashes); }

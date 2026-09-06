@@ -12,6 +12,10 @@ public sealed class ClientConfig
     public string VkHashes { get; set; } = "";
     public string TurnHost { get; set; } = "";
     public string TurnPort { get; set; } = "";
+    // Общее число транспортных потоков. Ядро принимает только полные группы
+    // по 9, поэтому UI предлагает диапазон 9..108 с таким же шагом.
+    public int WorkerCount { get; set; } = 18;
+    // Legacy-поля нужны только для миграции конфигурации Windows 3.12/3.13.
     public int WorkersPerHash { get; set; } = 9;
     public string Obfs { get; set; } = "video";
     // Начиная с CSQTT 2.1 сервер и клиент умеют работать через TURN UDP либо
@@ -51,7 +55,22 @@ public sealed class ClientConfig
         // в таком случае возвращаем конфигурацию со значениями по умолчанию.
         try
         {
-            var config = JsonSerializer.Deserialize<ClientConfig>(File.ReadAllText(PathName)) ?? new();
+            string json = File.ReadAllText(PathName);
+            var config = JsonSerializer.Deserialize<ClientConfig>(json) ?? new();
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty(nameof(WorkerCount), out _))
+            {
+                // Старый UI называл параметр «на хеш» и сам умножал его на
+                // число ручных хешей. Сохраняем фактическое старое значение.
+                int hashCount = config.VkHashes.Split([',', ' ', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+                    .Distinct(StringComparer.Ordinal)
+                    .Take(6)
+                    .Count();
+                int legacyTotal = config.VkHashMode == "auto_js"
+                    ? config.AutoWorkers
+                    : config.WorkersPerHash * Math.Max(1, hashCount);
+                config.WorkerCount = NormalizeWorkers(legacyTotal);
+            }
             // Первые Windows-сборки ошибочно использовали 8080, хотя Android и
             // deploy.sh используют 46002. Только это конкретное старое значение
             // мигрируется; любой другой выбранный пользователем порт сохраняется.
@@ -70,6 +89,8 @@ public sealed class ClientConfig
         Directory.CreateDirectory(Path.GetDirectoryName(PathName)!);
         File.WriteAllText(PathName, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
     }
+
+    private static int NormalizeWorkers(int value) => Math.Clamp(value, 9, 108) / 9 * 9;
 }
 
 /// <summary>Сохранённые параметры удалённого сервера. Пароли защищены DPAPI.</summary>

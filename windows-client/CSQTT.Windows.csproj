@@ -11,9 +11,9 @@
     <AssemblyName>CSQTT.Windows</AssemblyName>
     <!-- 3.13 is the first Windows release compatible with upstream CSQTT 2.1.9
          and wire protocol CSQTT-WIRE-3. -->
-    <Version>3.13.0</Version>
-    <AssemblyVersion>3.13.0.0</AssemblyVersion>
-    <FileVersion>3.13.0.0</FileVersion>
+    <Version>3.13.1</Version>
+    <AssemblyVersion>3.13.1.0</AssemblyVersion>
+    <FileVersion>3.13.1.0</FileVersion>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
   <ItemGroup>
