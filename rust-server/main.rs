@@ -1967,8 +1967,8 @@ async fn async_main() -> Result<()> {
     }
     if !args.device_id.is_empty() {
         db.main_device_id = args.device_id.clone();
-    } else if let Some(device_id) = deploy_overrides.device_id.as_ref() {
-        db.main_device_id = device_id.clone();
+    } else if !deploy_overrides.device_id.is_empty() {
+        db.main_device_id = deploy_overrides.device_id.clone();
     }
     if db.main_password.is_empty() {
         db.main_password = random_password() + &random_password();

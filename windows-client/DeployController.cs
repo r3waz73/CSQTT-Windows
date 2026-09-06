@@ -47,12 +47,17 @@ internal sealed class DeployController
             string scriptText = File.ReadAllText(bundledScript).Replace("\r\n", "\n").Replace('\r', '\n');
             File.WriteAllText(script, scriptText, new UTF8Encoding(false));
             File.WriteAllText(env, $"CSQTT_WEB_USER={Env(cfg.WebLogin)}\nCSQTT_WEB_PASS={Env(cfg.GetWebPassword())}\n", new UTF8Encoding(false));
-            File.WriteAllText(json, JsonSerializer.Serialize(new { main_password = cfg.GetMainPassword(), device_id = deviceId, dns = string.Join(',', new[] { cfg.Dns1, cfg.Dns2 }.Where(x => !string.IsNullOrWhiteSpace(x))) }), new UTF8Encoding(false));
+            // В 2.1.9 DNS хранится сервером в SQLite и меняется из web-панели
+            // без разрыва туннелей. Deploy override содержит только пароль и
+            // необязательную исходную привязку устройства.
+            File.WriteAllText(json, JsonSerializer.Serialize(new { main_password = cfg.GetMainPassword(), device_id = deviceId }), new UTF8Encoding(false));
             Progress?.Invoke(8, "Загрузка файлов…");
             Upload(sftp, script, "/tmp/deploy.sh", 10);
-            Upload(sftp, cfg.ServerBinaryPath, "/tmp/csqtt", 35);
-            Upload(sftp, env, "/tmp/csqtt.env", 55);
-            Upload(sftp, json, "/tmp/csqtt-deploy.json", 60);
+            // Имена одноразовых файлов являются частью контракта deploy.sh
+            // 2.1.9. Старые /tmp/csqtt* больше установщиком не читаются.
+            Upload(sftp, cfg.ServerBinaryPath, "/tmp/.csqtt-upload-server", 35);
+            Upload(sftp, env, "/tmp/.csqtt-upload-web.env", 55);
+            Upload(sftp, json, "/tmp/.csqtt-upload-overrides.json", 60);
             ct.ThrowIfCancellationRequested();
 
             Progress?.Invoke(65, "Установка сервера…");

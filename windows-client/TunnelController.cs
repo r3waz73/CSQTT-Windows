@@ -22,7 +22,10 @@ internal sealed partial class TunnelController : IAsyncDisposable
     private readonly RouteManager routes = new();
     private UdpClient? bridge;
     private readonly ConcurrentDictionary<string, byte> transportAddresses = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim dnsApplyLock = new(1, 1);
     private TaskCompletionSource<(string ip, string dns)> configReady = NewConfigWaiter();
+    private string latestDns = "", appliedDns = "";
+    private volatile bool routesReady;
     public event Action<string>? Log;
     public event Action<bool>? StateChanged;
 
@@ -46,6 +49,8 @@ internal sealed partial class TunnelController : IAsyncDisposable
         cts = new();
         transportAddresses.Clear();
         configReady = NewConfigWaiter();
+        routesReady = false;
+        latestDns = appliedDns = "";
         // После аварийного завершения адаптер может уже существовать, поэтому
         // сначала пробуем создать его, а затем открыть существующий.
         adapter = Wintun.CreateAdapter("CSQTT", "CSQTT", 0);
@@ -80,11 +85,20 @@ internal sealed partial class TunnelController : IAsyncDisposable
         // CONFIG is printed on stdout while TURN diagnostics use stderr. Give both
         // readers a short window to collect every address learned during auth.
         await Task.Delay(750, cts.Token);
+        // Если сервер успел прислать hot-DNS TUNCONF до завершения настройки
+        // маршрутов, применяем сразу последнее значение, а не первый снимок.
+        var newestDns = Volatile.Read(ref latestDns);
+        if (!string.IsNullOrWhiteSpace(newestDns)) conf = (conf.ip, newestDns);
         var hosts = new[] { cfg.Peer, cfg.TurnHost, "api.vk.me", "api.vk.ru", "login.vk.ru", "id.vk.com", "vk.com", "vk.ru", "calls.okcdn.ru", "api.ok.ru", "api.okcdn.ru" }
             .Concat(transportAddresses.Keys)
             .ToArray();
         Log?.Invoke($"[WINDOWS] Обход VPN для транспорта: {string.Join(", ", transportAddresses.Keys.Order())}");
         await routes.ConfigureAsync(conf.ip, conf.dns, hosts, cts.Token);
+        Volatile.Write(ref appliedDns, conf.dns);
+        routesReady = true;
+        // Закрывает ещё одну гонку: повторный TUNCONF мог прийти после чтения
+        // latestDns выше, но до окончания долгой настройки маршрутов.
+        await ApplyLatestDnsAsync(cts.Token);
         // Закрывает гонку между снимком hosts выше и окончанием ConfigureAsync:
         // каждый TURN IP, замеченный в этот промежуток, тоже получает /32 route.
         foreach (string address in transportAddresses.Keys)
@@ -101,7 +115,7 @@ internal sealed partial class TunnelController : IAsyncDisposable
         bool autoVk = c.VkHashMode == "auto_js";
         int hashes = c.VkHashes.Split([',', ' ', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Take(6).Count();
         int workers = autoVk ? Math.Clamp(c.AutoWorkers, 9, 54) : Math.Max(9, c.WorkersPerHash) * Math.Max(1, hashes);
-        var a = new List<string> { "-peer", c.Peer, "-n", workers.ToString(), "-listen", $"127.0.0.1:{port}", "-fingerprint", c.Fingerprint, "-client-ids", c.ClientIds, "-obfs", c.Obfs, "-vk-auth-mode", autoVk ? "auto_js" : c.VkAuthMode, "-vk-hash-mode", autoVk ? "auto_js" : "manual", "-device-id", c.DeviceId, "-password", password, "-captcha-mode", c.CaptchaMode };
+        var a = new List<string> { "-peer", c.Peer, "-n", workers.ToString(), "-listen", $"127.0.0.1:{port}", "-fingerprint", c.Fingerprint, "-client-ids", c.ClientIds, "-obfs", c.Obfs, "-turn-transport", c.TurnTransport, "-vk-auth-mode", autoVk ? "auto_js" : c.VkAuthMode, "-vk-hash-mode", autoVk ? "auto_js" : "manual", "-device-id", c.DeviceId, "-password", password, "-captcha-mode", c.CaptchaMode };
         if (autoVk) a.Add("--allow-hash-redistribution");
         else { a.Add("-vk"); a.Add(c.VkHashes); }
         if (!string.IsNullOrWhiteSpace(c.TurnHost)) { a.Add("-turn"); a.Add(c.TurnHost); }
@@ -133,9 +147,37 @@ internal sealed partial class TunnelController : IAsyncDisposable
             // Wire format: TUNCONF:<tunnel-ip>:<comma-separated-dns>:<local-port>.
             // The final port belongs to the core UDP listener, not to the DNS address.
             var m = TunConfigLine().Match(line);
-            if (m.Success) configReady.TrySetResult((m.Groups[1].Value, m.Groups[2].Value));
+            if (m.Success)
+            {
+                string nextIp = m.Groups[1].Value, nextDns = m.Groups[2].Value;
+                Volatile.Write(ref latestDns, nextDns);
+                bool first = configReady.TrySetResult((nextIp, nextDns));
+                if (!first && routesReady && !string.Equals(Volatile.Read(ref appliedDns), nextDns, StringComparison.Ordinal))
+                    await ApplyLatestDnsAsync(ct);
+            }
         }
     }
+
+    private async Task ApplyLatestDnsAsync(CancellationToken ct)
+    {
+        await dnsApplyLock.WaitAsync(ct);
+        try
+        {
+            // Значение читается уже под блокировкой. Если несколько TUNCONF
+            // пришли подряд, применяем только последний и не откатываем DNS
+            // более поздним завершением устаревшей операции.
+            string nextDns = Volatile.Read(ref latestDns);
+            if (!routesReady || string.IsNullOrWhiteSpace(nextDns)
+                || string.Equals(Volatile.Read(ref appliedDns), nextDns, StringComparison.Ordinal)) return;
+            await routes.UpdateDnsAsync(nextDns, ct);
+            Volatile.Write(ref appliedDns, nextDns);
+            Log?.Invoke($"[WINDOWS] DNS обновлён без переподключения: {nextDns}");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex) { Log?.Invoke($"[WINDOWS][ПРЕДУПРЕЖДЕНИЕ] Не удалось обновить DNS: {ex.Message}"); }
+        finally { dnsApplyLock.Release(); }
+    }
+
     private async Task TryAddTransportBypassAsync(string address, CancellationToken ct)
     {
         try
@@ -176,7 +218,7 @@ internal sealed partial class TunnelController : IAsyncDisposable
         // Interlocked.Exchange делает Stop идемпотентным: только первый вызов
         // получает активный CTS и действительно выполняет очистку ресурсов.
         var old = Interlocked.Exchange(ref cts, null); if (old is null) return;
-        old.Cancel(); routes.Dispose(); bridge?.Dispose(); bridge = null;
+        old.Cancel(); routesReady = false; routes.Dispose(); bridge?.Dispose(); bridge = null;
         try { if (core is { HasExited: false }) { core.StandardInput.WriteLine("STOP"); if (!core.WaitForExit(2000)) core.Kill(true); } } catch { }
         core?.Dispose(); core = null;
         if (session != 0) { Wintun.EndSession(session); session = 0; }

@@ -13,6 +13,7 @@ internal sealed class RouteManager : IDisposable
 {
     private readonly HashSet<string> bypass = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim routeLock = new(1, 1);
+    private readonly SemaphoreSlim dnsLock = new(1, 1);
     private string? gateway;
     private int physicalIndex;
 
@@ -42,18 +43,35 @@ internal sealed class RouteManager : IDisposable
         // Сервер выдаёт клиенту один адрес, поэтому используется маска /32.
         await Exec("netsh.exe", "interface ipv4 set address name=\"CSQTT\" source=static address=" + ip + " mask=255.255.255.255", ct);
         await Exec("netsh.exe", "interface ipv4 set subinterface \"CSQTT\" mtu=1300 store=active", ct);
+        await UpdateDnsAsync(dns, ct);
+        // Default route добавляется последним: к этому моменту все исключения
+        // уже существуют и управляющее соединение не потеряется.
+        await Exec("netsh.exe", "interface ipv4 add route prefix=0.0.0.0/0 interface=\"CSQTT\" nexthop=0.0.0.0 metric=5 store=active", ct);
+    }
+
+    /// <summary>
+    /// Применяет новый DNS-профиль, присланный сервером через повторный TUNCONF.
+    /// В CSQTT 2.1.9 сервер умеет менять DNS без разрыва TURN-сессий.
+    /// </summary>
+    public async Task UpdateDnsAsync(string dns, CancellationToken ct)
+    {
         var dnsServers = dns.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(value => IPAddress.TryParse(value, out var address) && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? address.ToString() : null)
             .Where(value => value is not null)
             .Distinct()
             .ToArray();
         if (dnsServers.Length == 0) throw new InvalidOperationException($"Сервер передал некорректный DNS: {dns}");
-        var dnsIndex = 1;
-        foreach (var server in dnsServers)
-            await Exec("netsh.exe", $"interface ipv4 add dnsservers name=\"CSQTT\" address={server} index={dnsIndex++} validate=no", ct);
-        // Default route добавляется последним: к этому моменту все исключения
-        // уже существуют и управляющее соединение не потеряется.
-        await Exec("netsh.exe", "interface ipv4 add route prefix=0.0.0.0/0 interface=\"CSQTT\" nexthop=0.0.0.0 metric=5 store=active", ct);
+        await dnsLock.WaitAsync(ct);
+        try
+        {
+            // Удаление выполняется тихо: при первом старте список может быть
+            // пуст, и это не является ошибкой.
+            RunQuiet("netsh.exe", "interface ipv4 delete dnsservers name=\"CSQTT\" all validate=no");
+            var dnsIndex = 1;
+            foreach (var server in dnsServers)
+                await Exec("netsh.exe", $"interface ipv4 add dnsservers name=\"CSQTT\" address={server} index={dnsIndex++} validate=no", ct);
+        }
+        finally { dnsLock.Release(); }
     }
 
     /// <summary>

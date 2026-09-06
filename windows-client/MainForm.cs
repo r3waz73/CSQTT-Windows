@@ -26,13 +26,13 @@ internal sealed class MainForm : Form
     private readonly TextBox link = Input(), peer = Input(), hashes = Input(true), password = Input(), turn = Input(), turnPort = Input(), ids = Input();
     private readonly ThemedLogView logs = new(200), deployLogs = new(500);
     private readonly NumericUpDown workers = new();
-    private readonly ComboBox obfs = SelectInput(), fingerprint = SelectInput(), auth = SelectInput(), captcha = SelectInput();
+    private readonly ComboBox obfs = SelectInput(), turnTransport = SelectInput(), fingerprint = SelectInput(), auth = SelectInput(), captcha = SelectInput();
     private readonly ComboBox vkMode = SelectInput(), deployMode = SelectInput();
     private readonly ComboBox logDetail = SelectInput();
     private readonly Button toggle = Button("Подключиться", Accent), connectionNav = NavButton("◉   Туннель"), deployNav = NavButton("⇧   Развернуть"), logNav = NavButton("≡   Журнал");
     private readonly Button vkLogin = Button("Войти через VK", Color.FromArgb(0, 119, 255)), deployStart = Button("Установить на сервер", Accent);
     private readonly Label vkState = new();
-    private readonly TextBox deployHost = Input(), deploySshPort = Input(), deployPeerPort = Input(), deployWebPort = Input(), deployUser = Input(), deploySshPassword = Input(), deployKey = Input(), deployKeyPass = Input(), deployBinary = Input(), deployMainPassword = Input(), deployWebLogin = Input(), deployWebPassword = Input(), deployDns1 = Input(), deployDns2 = Input();
+    private readonly TextBox deployHost = Input(), deploySshPort = Input(), deployPeerPort = Input(), deployWebPort = Input(), deployUser = Input(), deploySshPassword = Input(), deployKey = Input(), deployKeyPass = Input(), deployBinary = Input(), deployMainPassword = Input(), deployWebLogin = Input(), deployWebPassword = Input();
     private readonly CheckBox deployBindDevice = new() { Text = "Привязать главный пароль к этому компьютеру", AutoSize = true, ForeColor = TextMain };
     private readonly ProgressBar deployProgress = new();
     private readonly LogPresenter logPresenter = new();
@@ -47,7 +47,7 @@ internal sealed class MainForm : Form
     {
         // Конструктор строит дерево WinForms-контролов программно. Для небольшого
         // учебного проекта это удобнее Designer.cs и уменьшает число файлов.
-        Text = "CSQTT for Windows";
+        Text = "CSQTT for Windows 3.13";
         Width = 1080; Height = 760; MinimumSize = new(900, 650); StartPosition = FormStartPosition.CenterScreen;
         BackColor = Background; ForeColor = TextMain; Font = new("Segoe UI", 10); DoubleBuffered = true;
 
@@ -92,7 +92,7 @@ internal sealed class MainForm : Form
         connectionNav.Dock = DockStyle.Top; connectionNav.Height = 48; connectionNav.Margin = new(0, 8, 0, 0);
         logNav.Dock = DockStyle.Top; logNav.Height = 48;
         deployNav.Dock = DockStyle.Top; deployNav.Height = 48;
-        var license = new Label { Text = "CSQTT 2.0\nWindows client", ForeColor = TextMuted, Dock = DockStyle.Bottom, Height = 48 };
+        var license = new Label { Text = "CSQTT 2.1.9\nWindows client 3.13", ForeColor = TextMuted, Dock = DockStyle.Bottom, Height = 48 };
         // DockStyle.Top располагает элементы в обратном порядке добавления.
         // Поэтому deploy добавляется раньше log и визуально оказывается ниже.
         side.Controls.Add(license); side.Controls.Add(deployNav); side.Controls.Add(logNav); side.Controls.Add(connectionNav); side.Controls.Add(subtitle); side.Controls.Add(logo);
@@ -138,6 +138,7 @@ internal sealed class MainForm : Form
         var advanced = Card("Дополнительные настройки", "Меняйте их только если соответствующие параметры заданы на Android.");
         var extra = FormGrid();
         AddField(extra, "TURN host", turn); AddField(extra, "TURN port", turnPort);
+        AddField(extra, "TURN-транспорт", turnTransport, "UDP рекомендуется; TCP/TLS полезен в сетях, где UDP заблокирован");
         AddField(extra, "Обфускация", obfs); AddField(extra, "TLS fingerprint", fingerprint);
         AddField(extra, "Client IDs", ids); AddField(extra, "VK auth", auth); AddField(extra, "Captcha", captcha);
         advanced.Controls.Add(extra); cards.Controls.Add(advanced);
@@ -164,7 +165,7 @@ internal sealed class MainForm : Form
 
         var serverCard = Card("CSQTT-сервер", "Выберите Linux x86_64 musl-бинарник csqtt из сборки серверного проекта."); var server = FormGrid();
         AddBrowseField(server, "Бинарник csqtt", deployBinary, "csqtt|csqtt;csqtt.*|Все файлы (*.*)|*.*"); AddField(server, "Режим", deployMode);
-        AddField(server, "Peer-порт", deployPeerPort); AddField(server, "Web-порт", deployWebPort); AddField(server, "Основной DNS", deployDns1); AddField(server, "Резервный DNS", deployDns2);
+        AddField(server, "Peer-порт", deployPeerPort); AddField(server, "Web-порт", deployWebPort);
         deployMainPassword.UseSystemPasswordChar = true; AddField(server, "Пароль CSQTT", deployMainPassword); AddField(server, "Web-логин", deployWebLogin); deployWebPassword.UseSystemPasswordChar = true; AddField(server, "Web-пароль", deployWebPassword);
         AddField(server, "Привязка устройства", deployBindDevice, "По умолчанию первое подключение занимает главный пароль");
         serverCard.Controls.Add(server); cards.Controls.Add(serverCard);
@@ -194,7 +195,7 @@ internal sealed class MainForm : Form
         // нормализуются по списку допустимых вариантов.
         link.Text = cfg.GetLink(); peer.Text = cfg.Peer; hashes.Text = cfg.VkHashes; password.Text = cfg.GetPassword(); turn.Text = cfg.TurnHost; turnPort.Text = cfg.TurnPort; ids.Text = cfg.ClientIds;
         workers.Minimum = 9; workers.Maximum = 27; workers.Increment = 9; workers.Value = Math.Clamp(cfg.WorkersPerHash, 9, 27); StyleNumeric(workers);
-        Fill(obfs, ["video", "audio"], cfg.Obfs); Fill(fingerprint, ["firefox", "chrome", "edge", "safari", "opera"], cfg.Fingerprint); Fill(auth, ["vkcalls", "legacy"], cfg.VkAuthMode); Fill(captcha, ["auto", "manual"], cfg.CaptchaMode);
+        Fill(turnTransport, ["udp", "tcp_tls"], cfg.TurnTransport); Fill(obfs, ["video", "audio"], cfg.Obfs); Fill(fingerprint, ["firefox", "chrome", "edge", "safari", "opera"], cfg.Fingerprint); Fill(auth, ["vkcalls", "legacy"], cfg.VkAuthMode); Fill(captcha, ["auto", "manual"], cfg.CaptchaMode);
         Fill(vkMode, ["Автоматически (VK)", "Вручную"], cfg.VkHashMode == "auto_js" ? "Автоматически (VK)" : "Вручную");
         vkMode.SelectedIndexChanged += (_, _) => UpdateVkControls(); UpdateVkControls();
         vkState.Text = string.IsNullOrWhiteSpace(cfg.GetVkToken()) ? "Не выполнен вход" : $"Вход выполнен{(cfg.VkUserId.Length > 0 ? " · ID " + cfg.VkUserId : "")}";
@@ -206,7 +207,7 @@ internal sealed class MainForm : Form
             && string.Equals(Path.GetFileName(Path.GetDirectoryName(d.ServerBinaryPath)), "Assets", StringComparison.OrdinalIgnoreCase);
         if ((string.IsNullOrWhiteSpace(d.ServerBinaryPath) || !File.Exists(d.ServerBinaryPath) || legacyBundledPath) && File.Exists(bundledServer))
             d.ServerBinaryPath = bundledServer;
-        deployHost.Text = d.Host; deployUser.Text = d.User; deploySshPassword.Text = d.GetSshPassword(); deployKey.Text = d.PrivateKeyPath; deployKeyPass.Text = d.GetKeyPassphrase(); deployBinary.Text = d.ServerBinaryPath; deployMainPassword.Text = d.GetMainPassword(); deployWebLogin.Text = d.WebLogin; deployWebPassword.Text = d.GetWebPassword(); deployDns1.Text = d.Dns1; deployDns2.Text = d.Dns2; deployBindDevice.Checked = d.BindMainPasswordToThisDevice;
+        deployHost.Text = d.Host; deployUser.Text = d.User; deploySshPassword.Text = d.GetSshPassword(); deployKey.Text = d.PrivateKeyPath; deployKeyPass.Text = d.GetKeyPassphrase(); deployBinary.Text = d.ServerBinaryPath; deployMainPassword.Text = d.GetMainPassword(); deployWebLogin.Text = d.WebLogin; deployWebPassword.Text = d.GetWebPassword(); deployBindDevice.Checked = d.BindMainPasswordToThisDevice;
         deploySshPort.Text = d.SshPort.ToString(); deployPeerPort.Text = d.PeerPort.ToString(); deployWebPort.Text = d.WebPort.ToString(); Fill(deployMode, ["systemd", "docker"], d.Mode);
         Fill(logDetail, ["Минимум", "Средний", "Полный"], cfg.LogLevel);
         selectedLogLevel = logDetail.SelectedIndex;
@@ -246,8 +247,8 @@ internal sealed class MainForm : Form
     {
         // Секреты передаются отдельно: ClientConfig.SetSecrets шифрует их перед
         // сериализацией JSON.
-        cfg.Peer = peer.Text.Trim(); cfg.VkHashes = hashes.Text.Trim(); cfg.VkHashMode = vkMode.SelectedIndex == 0 ? "auto_js" : "manual"; cfg.TurnHost = turn.Text.Trim(); cfg.TurnPort = turnPort.Text.Trim(); cfg.WorkersPerHash = (int)workers.Value; cfg.Obfs = obfs.Text; cfg.Fingerprint = fingerprint.Text; cfg.ClientIds = ids.Text; cfg.VkAuthMode = auth.Text; cfg.CaptchaMode = captcha.Text; cfg.LogLevel = logDetail.Text;
-        var d = cfg.Deploy; d.Host = deployHost.Text.Trim(); d.User = deployUser.Text.Trim(); d.SshPort = ParsePort(deploySshPort.Text, d.SshPort, "SSH-порт", requireValidDeployPorts); d.PrivateKeyPath = deployKey.Text.Trim(); d.ServerBinaryPath = deployBinary.Text.Trim(); d.Mode = deployMode.Text; d.PeerPort = ParsePort(deployPeerPort.Text, d.PeerPort, "Peer-порт", requireValidDeployPorts); d.WebPort = ParsePort(deployWebPort.Text, d.WebPort, "Web-порт", requireValidDeployPorts); d.WebLogin = deployWebLogin.Text.Trim(); d.Dns1 = deployDns1.Text.Trim(); d.Dns2 = deployDns2.Text.Trim(); d.BindMainPasswordToThisDevice = deployBindDevice.Checked; d.SetSecrets(deploySshPassword.Text, deployKeyPass.Text, deployMainPassword.Text, deployWebPassword.Text);
+        cfg.Peer = peer.Text.Trim(); cfg.VkHashes = hashes.Text.Trim(); cfg.VkHashMode = vkMode.SelectedIndex == 0 ? "auto_js" : "manual"; cfg.TurnHost = turn.Text.Trim(); cfg.TurnPort = turnPort.Text.Trim(); cfg.WorkersPerHash = (int)workers.Value; cfg.TurnTransport = turnTransport.Text; cfg.Obfs = obfs.Text; cfg.Fingerprint = fingerprint.Text; cfg.ClientIds = ids.Text; cfg.VkAuthMode = auth.Text; cfg.CaptchaMode = captcha.Text; cfg.LogLevel = logDetail.Text;
+        var d = cfg.Deploy; d.Host = deployHost.Text.Trim(); d.User = deployUser.Text.Trim(); d.SshPort = ParsePort(deploySshPort.Text, d.SshPort, "SSH-порт", requireValidDeployPorts); d.PrivateKeyPath = deployKey.Text.Trim(); d.ServerBinaryPath = deployBinary.Text.Trim(); d.Mode = deployMode.Text; d.PeerPort = ParsePort(deployPeerPort.Text, d.PeerPort, "Peer-порт", requireValidDeployPorts); d.WebPort = ParsePort(deployWebPort.Text, d.WebPort, "Web-порт", requireValidDeployPorts); d.WebLogin = deployWebLogin.Text.Trim(); d.BindMainPasswordToThisDevice = deployBindDevice.Checked; d.SetSecrets(deploySshPassword.Text, deployKeyPass.Text, deployMainPassword.Text, deployWebPassword.Text);
         cfg.SetSecrets(link.Text.Trim(), password.Text); cfg.Save();
     }
 
@@ -257,7 +258,7 @@ internal sealed class MainForm : Form
         // запущен с копией этих аргументов и не увидит правки формы.
         toggle.Text = running ? "Отключиться" : "Подключиться"; toggle.BackColor = running ? Color.FromArgb(220, 70, 90) : Accent;
         status.Text = running ? "●  Туннель активен" : "●  Отключено"; status.ForeColor = running ? Success : TextMuted;
-        foreach (Control control in new Control[] { link, peer, hashes, password, vkMode, vkLogin, turn, turnPort, workers, obfs, fingerprint, ids, auth, captcha }) control.Enabled = !running;
+        foreach (Control control in new Control[] { link, peer, hashes, password, vkMode, vkLogin, turn, turnPort, workers, turnTransport, obfs, fingerprint, ids, auth, captcha }) control.Enabled = !running;
         if (!running) UpdateVkControls();
     }
 

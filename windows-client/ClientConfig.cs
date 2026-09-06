@@ -14,6 +14,9 @@ public sealed class ClientConfig
     public string TurnPort { get; set; } = "";
     public int WorkersPerHash { get; set; } = 9;
     public string Obfs { get; set; } = "video";
+    // Начиная с CSQTT 2.1 сервер и клиент умеют работать через TURN UDP либо
+    // TURN TCP/TLS. Значение совпадает с Android и напрямую передаётся ядру.
+    public string TurnTransport { get; set; } = "udp";
     public string Fingerprint { get; set; } = "firefox";
     public string ClientIds { get; set; } = "8202606,6287487";
     public string VkAuthMode { get; set; } = "vkcalls";
@@ -81,8 +84,10 @@ public sealed class DeployConfig
     public int PeerPort { get; set; } = 46000;
     public int WebPort { get; set; } = 46002;
     public string WebLogin { get; set; } = "admin";
-    public string Dns1 { get; set; } = "1.1.1.1";
-    public string Dns2 { get; set; } = "1.0.0.1";
+    // Оставлены для чтения конфигураций Windows 3.12. В CSQTT 2.1.9 DNS
+    // выбирается в web-панели сервера и хранится в его SQLite-базе.
+    public string Dns1 { get; set; } = "";
+    public string Dns2 { get; set; } = "";
     public string CertificatePath { get; set; } = "";
     public bool BindMainPasswordToThisDevice { get; set; } = false;
     public string ProtectedSshPassword { get; set; } = "";

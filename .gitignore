@@ -1,0 +1,9 @@
+/.dotnet-cli/
+/.nuget-packages/
+/build/
+/rust-client/target/
+/openwrt-client/build/
+/openwrt-client/dist/
+/csqtt-uring/Cargo.lock
+/app/src/main/assets/csqtt
+/app/src/main/assets/csqtt-linux-*

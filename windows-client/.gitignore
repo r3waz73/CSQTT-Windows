@@ -1,6 +1,7 @@
 bin/
 obj/
 publish/
+outputs/
 native/
 Core/rust-client/target/
 .dotnet-cli/
