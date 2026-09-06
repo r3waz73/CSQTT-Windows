@@ -3,26 +3,35 @@
 
 use crate::{
     auth::TurnCredentials,
+    client_perf::{self, Stage as PerfStage},
     dispatcher::{Dispatcher, PacketReceiver, WorkerChannels, packet_channel},
     events::Events,
     obfs::{ObfsCipher, ObfsConfig, ObfsMode, ObfsState, is_rtp_packet},
     packet::{PacketBuf, PacketPool},
     protocol::{
         ConfigResponse, config_request, disconnect_request, is_config_response,
-        is_control_response, is_panel_restart_notice, parse_config_response,
+        is_control_response, is_panel_restart_notice, parse_config_response, parse_stream_alive,
+        parse_stream_repair,
     },
+    repair::RepairState,
     selective_fec,
     stats::Stats,
-    turn::{TurnAllocation, TurnReceiver, TurnRequestError},
+    striped_scheduler::PacketClass,
+    turn::{TurnAllocation, TurnConnectTarget, TurnReceiver, TurnRequestError},
+    turn_endpoint::{TurnTransportMode, resolve_turn_endpoints},
 };
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
+#[cfg(test)]
+use std::time::Instant;
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -30,26 +39,20 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const KEEPALIVE_BYTE: u8 = 0xff;
-const PATH_RECEIPT_ACK: &[u8] = b"\xffCSQTT_RX_ACK";
-const PATH_PROBE_V2_MAGIC: &[u8; 4] = b"CSQ2";
 const CONFIG_RESPONSE_TIMEOUT_MS: [u64; 3] = [750, 1_500, 3_000];
-const DEALLOCATE_TIMEOUT: Duration = Duration::from_secs(1);
+const DEALLOCATE_TIMEOUT: Duration = Duration::from_millis(700);
 const CONNECT_CANCEL_GRACE: Duration = Duration::from_secs(1);
-const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_millis(1_500);
-const DISCONNECT_SEND_TIMEOUT: Duration = Duration::from_millis(750);
-const PATH_PROBE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
-const PATH_PROBE_MISS_LIMIT: u8 = 3;
-const PATH_PROBE_BYTES: usize = 45;
-const PATH_PROBE_SCHEDULER_STALL: Duration = Duration::from_secs(5);
-const WORKER_QUEUE_MAX_AGE: Duration = Duration::from_millis(2000);
-const WORKER_NORMAL_CAPACITY: usize = 128;
-const WORKER_SMALL_CAPACITY: usize = 128;
-const WORKER_BULK_CAPACITY: usize = 256;
-const WORKER_DOOMSDAY_CAPACITY: usize = 128;
-const WRITER_SCHEDULE: [u8; 8] = [1, 2, 0, 2, 1, 2, 0, 2];
-const WRITER_COMMAND_CAPACITY: usize = 4;
-const WRITER_COMMAND_CHECK_PACKETS: usize = 32;
+const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const DISCONNECT_SEND_TIMEOUT: Duration = Duration::from_millis(300);
+const DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(350);
+const DISCONNECT_CONTROL_ATTEMPTS: usize = 2;
+const WORKER_LATENCY_CAPACITY: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
+const WORKER_PRIORITY_CAPACITY: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
+const WORKER_BULK_CAPACITY: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
+const WRITER_COMMAND_CAPACITY: usize = 16;
+const WRITER_LATENCY_BATCH_LIMIT: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
+const WRITER_PRIORITY_BATCH_LIMIT: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
+const WRITER_BULK_BATCH_LIMIT: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
 static NEXT_INCARNATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -82,6 +85,7 @@ pub struct SessionConfig {
     pub peer: SocketAddr,
     pub turn_host: Option<Arc<str>>,
     pub turn_port: Option<Arc<str>>,
+    pub turn_transport: TurnTransportMode,
     pub local_port: Arc<str>,
     pub device_id: Arc<str>,
     pub password: Arc<str>,
@@ -91,6 +95,9 @@ pub struct SessionConfig {
     pub mode: ObfsMode,
     pub wrap_key: [u8; 32],
     pub get_config: bool,
+    pub desired_count: usize,
+    pub server_stream_repair: Arc<AtomicBool>,
+    pub repair: Arc<RepairState>,
 }
 
 pub struct SessionRuntime {
@@ -98,10 +105,25 @@ pub struct SessionRuntime {
     pub pool: Arc<PacketPool>,
     pub stats: Arc<Stats>,
     pub events: Events,
-    pub config_tx: Option<mpsc::Sender<String>>,
+    pub config_tx: mpsc::Sender<String>,
     pub config_delivery: Option<ConfigDeliveryState>,
     pub cancel: CancellationToken,
+    pub shutdown: Arc<ShutdownCoordinator>,
     pub ready_tx: Option<oneshot::Sender<()>>,
+    pub allocation_started: Option<oneshot::Sender<()>>,
+    pub allocation_ready: Option<oneshot::Sender<()>>,
+}
+
+fn build_registration_payload(config: &SessionConfig) -> Bytes {
+    Bytes::from(config_request(
+        &config.local_port,
+        &config.device_id,
+        &config.password,
+        config.generation,
+        &config.salt,
+        config.id,
+        Some(config.desired_count),
+    ))
 }
 
 pub struct ConfigDeliveryState {
@@ -129,6 +151,8 @@ struct TransportWriter {
     shared: Arc<TransportShared>,
     write_state: ObfsState,
     fec_budget: selective_fec::Budget,
+    pending_data: VecDeque<PacketBuf>,
+    mmsg_data: Vec<PacketBuf>,
 }
 
 struct TransportReader {
@@ -139,31 +163,215 @@ struct TransportReader {
 
 enum WriterCommand {
     SendBytes {
-        data: Box<[u8]>,
+        data: Bytes,
         completion: oneshot::Sender<Result<()>>,
     },
 }
 
 struct WriterRuntime {
-    normal: PacketReceiver,
-    small: PacketReceiver,
+    latency: PacketReceiver,
+    priority: PacketReceiver,
     bulk: PacketReceiver,
-    doomsday: PacketReceiver,
     commands: mpsc::Receiver<WriterCommand>,
-    path_probe: Option<Box<[u8]>>,
-    unanswered_probes: Arc<AtomicU8>,
-    outstanding_probe: Arc<AtomicU64>,
-    stats: Arc<Stats>,
-    initial_path_validation: bool,
+    shutdown: Arc<ShutdownCoordinator>,
+    activity: Arc<AtomicU64>,
+}
+
+struct WriterPacket {
+    packet: PacketBuf,
+    class: PacketClass,
 }
 
 struct ReaderRuntime {
     dispatcher: Arc<Dispatcher>,
-    unanswered_probes: Arc<AtomicU8>,
-    outstanding_probe: Arc<AtomicU64>,
-    stats: Arc<Stats>,
     events: Events,
-    worker_id: usize,
+    repair: Arc<RepairState>,
+    shutdown: Arc<ShutdownCoordinator>,
+    config_tx: mpsc::Sender<String>,
+}
+
+pub struct ShutdownCoordinator {
+    state: Mutex<ShutdownState>,
+    changed: tokio::sync::Notify,
+    next_activity: AtomicU64,
+}
+
+struct ShutdownState {
+    active: bool,
+    completed: bool,
+    streams: Vec<ShutdownControlStream>,
+}
+
+struct ShutdownControlStream {
+    incarnation_id: u64,
+    writer: mpsc::Sender<WriterCommand>,
+    activity: Arc<AtomicU64>,
+}
+
+struct ShutdownRegistration {
+    coordinator: Arc<ShutdownCoordinator>,
+    incarnation_id: u64,
+    activity: Arc<AtomicU64>,
+}
+
+impl ShutdownCoordinator {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(ShutdownState {
+                active: false,
+                completed: false,
+                streams: Vec::new(),
+            }),
+            changed: tokio::sync::Notify::new(),
+            next_activity: AtomicU64::new(1),
+        }
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        incarnation_id: u64,
+        writer: mpsc::Sender<WriterCommand>,
+    ) -> ShutdownRegistration {
+        let activity = Arc::new(AtomicU64::new(self.next_activity()));
+        let mut state = self.lock_state();
+        if !state.active {
+            state.streams.push(ShutdownControlStream {
+                incarnation_id,
+                writer,
+                activity: activity.clone(),
+            });
+        }
+        ShutdownRegistration {
+            coordinator: self.clone(),
+            incarnation_id,
+            activity,
+        }
+    }
+
+    fn mark_activity(&self, activity: &AtomicU64) {
+        activity.store(self.next_activity(), Ordering::Release);
+    }
+
+    async fn request_disconnect(&self, device_id: &str, salt: &str) {
+        let leader = {
+            let mut state = self.lock_state();
+            if state.active {
+                false
+            } else {
+                state.active = true;
+                state.completed = false;
+                true
+            }
+        };
+        if !leader {
+            self.wait_until_completed(Duration::from_secs(2)).await;
+            return;
+        }
+
+        let request = disconnect_request(device_id, salt);
+        for writer in self
+            .control_streams()
+            .into_iter()
+            .take(DISCONNECT_CONTROL_ATTEMPTS)
+        {
+            if self.is_completed() {
+                break;
+            }
+            let delivered = tokio::time::timeout(
+                DISCONNECT_SEND_TIMEOUT,
+                send_writer_bytes(&writer, request.as_bytes()),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok());
+            if delivered && self.wait_until_completed(DISCONNECT_ACK_TIMEOUT).await {
+                break;
+            }
+        }
+        self.complete();
+    }
+
+    fn observe_control_response(&self, response: &[u8]) -> bool {
+        if response != b"OK:disconnected" && !response.starts_with(b"DENIED:") {
+            return false;
+        }
+        let mut state = self.lock_state();
+        if !state.active || state.completed {
+            return false;
+        }
+        state.completed = true;
+        drop(state);
+        self.changed.notify_waiters();
+        true
+    }
+
+    fn control_streams(&self) -> Vec<mpsc::Sender<WriterCommand>> {
+        let state = self.lock_state();
+        let mut streams: Vec<_> = state
+            .streams
+            .iter()
+            .map(|stream| {
+                (
+                    stream.activity.load(Ordering::Acquire),
+                    stream.incarnation_id,
+                    stream.writer.clone(),
+                )
+            })
+            .collect();
+        streams.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
+        });
+        streams.into_iter().map(|(_, _, writer)| writer).collect()
+    }
+
+    fn complete(&self) {
+        let mut state = self.lock_state();
+        if state.completed {
+            return;
+        }
+        state.completed = true;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn is_completed(&self) -> bool {
+        self.lock_state().completed
+    }
+
+    async fn wait_until_completed(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.changed.notified();
+            if self.is_completed() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.is_completed();
+            }
+        }
+    }
+
+    fn unregister(&self, incarnation_id: u64) {
+        let mut state = self.lock_state();
+        state
+            .streams
+            .retain(|stream| stream.incarnation_id != incarnation_id);
+    }
+
+    fn next_activity(&self) -> u64 {
+        self.next_activity.fetch_add(1, Ordering::Relaxed).max(1)
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ShutdownState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for ShutdownRegistration {
+    fn drop(&mut self) {
+        self.coordinator.unregister(self.incarnation_id);
+    }
 }
 
 struct ReplayWindow {
@@ -246,6 +454,18 @@ impl ReplayWindow {
     }
 }
 
+fn authenticate_inbound(
+    cipher: &ObfsCipher,
+    config: &ObfsConfig,
+    replay: &mut ReplayProtection,
+    packet: &mut PacketBuf,
+) -> bool {
+    is_rtp_packet(packet.as_slice())
+        && cipher
+            .unwrap(packet, config.mode)
+            .is_ok_and(|sequence| replay.rtp.accept_rtp(sequence))
+}
+
 struct ActiveConnection {
     stats: Arc<Stats>,
     events: Events,
@@ -273,18 +493,6 @@ impl Drop for WorkerRegistration {
     }
 }
 
-fn authenticate_inbound(
-    cipher: &ObfsCipher,
-    config: &ObfsConfig,
-    replay: &mut ReplayProtection,
-    packet: &mut PacketBuf,
-) -> bool {
-    is_rtp_packet(packet.as_slice())
-        && cipher
-            .unwrap(packet, config.mode)
-            .is_ok_and(|sequence| replay.rtp.accept_rtp(sequence))
-}
-
 impl ActiveConnection {
     fn new(stats: Arc<Stats>, events: Events) -> Self {
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -306,23 +514,75 @@ impl TransportWriter {
             shared,
             write_state: ObfsState::new(),
             fec_budget: selective_fec::Budget::new(),
+            pending_data: VecDeque::with_capacity(WRITER_BULK_BATCH_LIMIT),
+            mmsg_data: Vec::with_capacity(WRITER_BULK_BATCH_LIMIT),
         }
     }
 
     async fn send_data(&mut self, packet: PacketBuf) -> Result<()> {
-        self.send_packet(packet).await
+        self.send_packet(packet).await?;
+        Ok(())
     }
 
     async fn send_packet(&mut self, mut packet: PacketBuf) -> Result<()> {
-        let duplicate =
-            selective_fec::should_duplicate(packet.as_slice()) && self.fec_budget.allow();
-        self.shared
-            .cipher
-            .wrap(&mut packet, &self.shared.config, &mut self.write_state)?;
+        let duplicate = self.prepare_packet(&mut packet)?;
         self.shared
             .allocation
-            .send_with_duplicate(&mut packet, duplicate)
+            .send_with_duplicate(packet, duplicate)
             .await?;
+        Ok(())
+    }
+
+    fn prepare_packet(&mut self, packet: &mut PacketBuf) -> Result<bool> {
+        let duplicate =
+            selective_fec::should_duplicate(packet.as_slice()) && self.fec_budget.allow();
+        client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
+            self.shared
+                .cipher
+                .wrap(packet, &self.shared.config, &mut self.write_state)
+        })?;
+        Ok(duplicate)
+    }
+
+    fn queue_data(&mut self, packet: PacketBuf) {
+        debug_assert!(self.pending_data.len() < WRITER_BULK_BATCH_LIMIT);
+        self.pending_data.push_back(packet);
+    }
+
+    async fn flush_queued_data(&mut self) -> Result<()> {
+        if self.pending_data.len() == 1
+            && let Some(packet) = self.pending_data.pop_front()
+        {
+            return self.send_data(packet).await;
+        }
+
+        while let Some(mut packet) = self.pending_data.pop_front() {
+            if self.prepare_packet(&mut packet)? {
+                self.flush_mmsg_data().await?;
+                self.shared
+                    .allocation
+                    .send_with_duplicate(packet, true)
+                    .await?;
+                continue;
+            }
+
+            self.mmsg_data.push(packet);
+            if self.mmsg_data.len() == WRITER_BULK_BATCH_LIMIT {
+                self.flush_mmsg_data().await?;
+            }
+        }
+        self.flush_mmsg_data().await
+    }
+
+    async fn flush_mmsg_data(&mut self) -> Result<()> {
+        if self.mmsg_data.is_empty() {
+            return Ok(());
+        }
+        self.shared
+            .allocation
+            .send_data_batch(&mut self.mmsg_data)
+            .await?;
+        self.mmsg_data.clear();
         Ok(())
     }
 
@@ -358,12 +618,16 @@ impl TransportReader {
                 .recv()
                 .await
                 .context("TURN allocation receive")?;
-            if authenticate_inbound(
-                &self.shared.cipher,
-                &self.shared.config,
-                &mut self.replay,
-                &mut packet,
-            ) {
+            client_perf::observe(PerfStage::TurnRx);
+            let accepted = client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
+                authenticate_inbound(
+                    &self.shared.cipher,
+                    &self.shared.config,
+                    &mut self.replay,
+                    &mut packet,
+                )
+            });
+            if accepted {
                 return Ok(packet);
             }
         }
@@ -373,26 +637,28 @@ impl TransportReader {
 pub async fn run_session(
     config: SessionConfig,
     credentials: TurnCredentials,
-    runtime: SessionRuntime,
+    mut runtime: SessionRuntime,
 ) -> Result<bool> {
     if credentials.server_addresses.is_empty() {
-        bail!("РЅРµС‚ TURN URL РІ СѓС‡РµС‚РЅС‹С… РґР°РЅРЅС‹С…");
+        bail!("нет TURN URL в учётных данных");
     }
-    let selected = credentials.server_addresses[turn_endpoint_index(
-        config.id,
-        config.turn_endpoint_cursor,
-        credentials.server_addresses.len(),
-    )]
-    .as_ref();
-    let turn_address = override_turn_address(
-        selected,
-        config.turn_host.as_deref(),
-        config.turn_port.as_deref(),
-    )?;
+    let turn_address = select_turn_address(&credentials.server_addresses, &config)?;
+    let turn_path = turn_path_key(turn_address, &config)?;
     crate::log_error!("[TURN] Подключение к {turn_address}");
     let cancel = runtime.cancel.clone();
+    let turn_host = config.turn_host.clone();
+    let turn_port = config.turn_port.clone();
+    let turn_transport = config.turn_transport;
+    if let Some(started) = runtime.allocation_started.take() {
+        let _ = started.send(());
+    }
     let mut connect = Box::pin(TurnAllocation::connect(
-        &turn_address,
+        TurnConnectTarget {
+            address: turn_address,
+            override_host: turn_host.as_deref(),
+            override_port: turn_port.as_deref(),
+            transport_mode: turn_transport,
+        },
         credentials.username,
         credentials.password,
         config.peer,
@@ -408,11 +674,11 @@ pub async fn run_session(
             return Ok(false);
         },
     };
-    crate::log_error!(
-        "[РЎР•РЎРЎР˜РЇ #{}] Relay: {}",
-        config.id,
-        allocation.local_addr()
-    );
+    drop(connect);
+    if let Some(ready) = runtime.allocation_ready.take() {
+        let _ = ready.send(());
+    }
+    crate::log_error!("[СЕССИЯ #{}] Relay: {}", config.id, allocation.local_addr());
     let channel = tokio::select! {
         biased;
         result = allocation.prepare_channel() => result,
@@ -423,12 +689,13 @@ pub async fn run_session(
     };
     if let Err(error) = channel {
         let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
-        return Err(error.context("TURN ChannelBind РѕР±СЏР·Р°С‚РµР»РµРЅ"));
+        return Err(error.context("TURN ChannelBind обязателен"));
     }
     let session = tokio::spawn(run_allocated_session(
         config,
         runtime,
         allocation.clone(),
+        turn_path,
     ));
     let result = await_session_task(&cancel, session).await;
     let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
@@ -443,8 +710,8 @@ async fn await_session_task(
         biased;
         result = &mut session => match result {
             Ok(result) => result,
-            Err(error) if error.is_panic() => Err(anyhow!("РїР°РЅРёРєР° СЃРµСЃСЃРёРё РёР·РѕР»РёСЂРѕРІР°РЅР°: {error}")),
-            Err(error) => Err(anyhow!("Р·Р°РґР°С‡Р° СЃРµСЃСЃРёРё Р·Р°РІРµСЂС€РµРЅР° Р°РІР°СЂРёР№РЅРѕ: {error}")),
+            Err(error) if error.is_panic() => Err(anyhow!("паника сессии изолирована: {error}")),
+            Err(error) => Err(anyhow!("задача сессии завершена аварийно: {error}")),
         },
         _ = cancel.cancelled() => {
             match tokio::time::timeout(SESSION_SHUTDOWN_GRACE, &mut session).await {
@@ -469,11 +736,12 @@ async fn run_allocated_session(
     config: SessionConfig,
     mut runtime: SessionRuntime,
     allocation: Arc<TurnAllocation>,
+    turn_path: Arc<str>,
 ) -> Result<bool> {
     let session_cancel = CancellationToken::new();
     let turn_receiver = allocation.take_receiver()?;
     crate::log_error!(
-        "[РЎР•РЎРЎРРЇ #{}] [DIRECT] РџСЂСЏРјРѕР№ СЂРµР¶РёРј РѕР±С„СѓСЃРєР°С†РёРё ({:?})",
+        "[СЕССИЯ #{}] [DIRECT] Прямой режим обфускации ({:?})",
         config.id,
         config.mode
     );
@@ -486,7 +754,7 @@ async fn run_allocated_session(
     let mut writer_transport = TransportWriter::new(shared.clone());
     let mut reader_transport = TransportReader::new(shared, turn_receiver);
     let incarnation_id = NEXT_INCARNATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
-    let config_tx = config.get_config.then_some(runtime.config_tx).flatten();
+    let config_tx = config.get_config.then(|| runtime.config_tx.clone());
     let config_delivered = match request_configuration(
         &mut writer_transport,
         &mut reader_transport,
@@ -510,49 +778,41 @@ async fn run_allocated_session(
             return Err(error);
         }
     };
-    let (normal_tx, normal_rx) = packet_channel(WORKER_NORMAL_CAPACITY, WORKER_QUEUE_MAX_AGE, true);
-    let (small_tx, small_rx) = packet_channel(WORKER_SMALL_CAPACITY, WORKER_QUEUE_MAX_AGE, true);
-    let (bulk_tx, bulk_rx) = packet_channel(WORKER_BULK_CAPACITY, WORKER_QUEUE_MAX_AGE, true);
-    let (doomsday_tx, doomsday_rx) =
-        packet_channel(WORKER_DOOMSDAY_CAPACITY, WORKER_QUEUE_MAX_AGE, true);
+    let (latency_tx, latency_rx) = packet_channel(WORKER_LATENCY_CAPACITY, true);
+    let (priority_tx, priority_rx) = packet_channel(WORKER_PRIORITY_CAPACITY, true);
+    let (bulk_tx, bulk_rx) = packet_channel(WORKER_BULK_CAPACITY, true);
     let worker_channels = WorkerChannels {
         id: config.id,
         incarnation_id,
-        normal: normal_tx,
-        small: small_tx,
+        turn_path,
+        latency: latency_tx,
+        priority: priority_tx,
         bulk: bulk_tx,
-        doomsday: doomsday_tx,
     };
+    let (writer_command_tx, writer_command_rx) = mpsc::channel(WRITER_COMMAND_CAPACITY);
+    let shutdown_registration = runtime
+        .shutdown
+        .register(incarnation_id, writer_command_tx.clone());
+    let writer_activity = shutdown_registration.activity.clone();
     runtime.dispatcher.register(worker_channels.clone());
     let _registration =
         WorkerRegistration::new(runtime.dispatcher.clone(), config.id, incarnation_id);
     if let Some(ready_tx) = runtime.ready_tx.take() {
         let _ = ready_tx.send(());
     }
-    crate::log_error!(
-        "[Р’РћР РљР•Р  #{}] [READY] РџРѕС‚РѕРє РіРѕС‚РѕРІ вњ“",
-        config.id
-    );
+    crate::log_error!("[ВОРКЕР #{}] [READY] Поток готов ✓", config.id);
     runtime.events.ready(config.id);
+    config.repair.mark_ready(config.id);
     let _active = ActiveConnection::new(runtime.stats.clone(), runtime.events.clone());
-    let (writer_command_tx, writer_command_rx) = mpsc::channel(WRITER_COMMAND_CAPACITY);
-    let path_probe = smart_ping_payload(&config.device_id, config.generation, config.id);
-    let initial_path_validation = false;
-    let unanswered_probes = Arc::new(AtomicU8::new(0));
-    let outstanding_probe = Arc::new(AtomicU64::new(0));
     let mut writer = tokio::spawn(writer_loop(
         writer_transport,
         WriterRuntime {
-            normal: normal_rx,
-            small: small_rx,
+            latency: latency_rx,
+            priority: priority_rx,
             bulk: bulk_rx,
-            doomsday: doomsday_rx,
             commands: writer_command_rx,
-            path_probe,
-            unanswered_probes: unanswered_probes.clone(),
-            outstanding_probe: outstanding_probe.clone(),
-            stats: runtime.stats.clone(),
-            initial_path_validation,
+            shutdown: runtime.shutdown.clone(),
+            activity: writer_activity,
         },
         session_cancel.clone(),
     ));
@@ -560,22 +820,25 @@ async fn run_allocated_session(
         reader_transport,
         ReaderRuntime {
             dispatcher: runtime.dispatcher.clone(),
-            unanswered_probes,
-            outstanding_probe,
-            stats: runtime.stats.clone(),
             events: runtime.events.clone(),
-            worker_id: config.id,
+            repair: config.repair.clone(),
+            shutdown: runtime.shutdown.clone(),
+            config_tx: runtime.config_tx.clone(),
         },
         session_cancel.clone(),
     ));
+    let repair_generation = config.repair.restart_generation(config.id);
     let (session_result, completed): (Result<()>, u8) = tokio::select! {
+        biased;
         _ = runtime.cancel.cancelled() => {
-            let request = disconnect_request(&config.device_id, &config.salt);
-            let _ = tokio::time::timeout(
-                DISCONNECT_SEND_TIMEOUT,
-                send_writer_bytes(&writer_command_tx, request.as_bytes()),
-            ).await;
+            runtime
+                .shutdown
+                .request_disconnect(&config.device_id, &config.salt)
+                .await;
             (Ok(()), 0)
+        }
+        _ = config.repair.changed(config.id, repair_generation) => {
+            (Err(anyhow!("TARGET_REPAIR")), 0)
         }
         result = &mut writer => {
             (result.map_err(anyhow::Error::from).and_then(|value| value), 1)
@@ -586,7 +849,7 @@ async fn run_allocated_session(
     };
     session_cancel.cancel();
     stop_session_tasks(completed, writer, reader).await;
-    crate::log_error!("[РЎР•РЎРЎРРЇ #{}] Р—Р°РІРµСЂС€РµРЅР°", config.id);
+    crate::log_error!("[СЕССИЯ #{}] Завершена", config.id);
     session_result?;
     Ok(config_delivered)
 }
@@ -621,25 +884,17 @@ async fn request_configuration(
     events: &Events,
     config_tx: Option<mpsc::Sender<String>>,
 ) -> Result<bool> {
-    let request = config_request(
-        &config.local_port,
-        &config.device_id,
-        &config.password,
-        config.generation,
-        &config.salt,
-        config.id,
-    );
+    let request = build_registration_payload(config);
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
         writer
-            .send_bytes(request.as_bytes())
+            .send_bytes(request.as_ref())
             .await
-            .context("РѕС‚РїСЂР°РІРєР° GETCONF")?;
+            .context("отправка GETCONF")?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         let packet = loop {
             match tokio::time::timeout_at(deadline, reader.recv()).await {
                 Ok(result) => {
-                    let packet =
-                        result.context("GETCONF С‡С‚РµРЅРёРµ РѕС‚РІРµС‚Р° РєРѕРЅС„РёРіР°")?;
+                    let packet = result.context("GETCONF чтение ответа конфига")?;
                     if is_panel_restart_notice(packet.as_slice()) {
                         events.panel_restart();
                         continue;
@@ -651,29 +906,43 @@ async fn request_configuration(
                 }
                 Err(_) if attempt + 1 < CONFIG_RESPONSE_TIMEOUT_MS.len() => continue 'attempts,
                 Err(_) => {
-                    bail!(
-                        "GETCONF С‡С‚РµРЅРёРµ РѕС‚РІРµС‚Р° РєРѕРЅС„РёРіР°: timeout РїРѕСЃР»Рµ {} РїРѕРїС‹С‚РѕРє",
+                    let message = format!(
+                        "FATAL_HANDSHAKE: сервер не подтвердил конфигурацию после {} попыток; проверьте пароль подключения и совместимость клиента с сервером",
                         CONFIG_RESPONSE_TIMEOUT_MS.len()
-                    )
+                    );
+                    if config.get_config {
+                        events.error("handshake_timeout", &message, true);
+                    }
+                    bail!(message)
                 }
             }
         };
-        match parse_config_response(packet.as_slice())? {
+        let response = parse_config_response(packet.as_slice()).inspect_err(|error| {
+            let message = error.to_string();
+            if config.get_config && message.contains("FATAL_") {
+                events.error("handshake_rejected", &message, true);
+            }
+        })?;
+        match response {
             ConfigResponse::NoConfig => return Ok(false),
             ConfigResponse::Config(value) => {
+                if value.ends_with(":stream-v1") || value.ends_with(":stream-v2") {
+                    config.server_stream_repair.store(true, Ordering::Release);
+                }
                 if let Some(sender) = &config_tx {
                     let _ = sender.try_send(value);
                 }
-                crate::log_error!("[Р’РћР РљР•Р  #{}] РљРѕРЅС„РёРі РїРѕР»СѓС‡РµРЅ", config.id);
+                crate::log_error!("[ВОРКЕР #{}] Конфиг получен", config.id);
                 return Ok(true);
             }
         }
     }
-    bail!("GETCONF РѕС‚РІРµС‚ РЅРµ РїРѕР»СѓС‡РµРЅ")
+    let message = "FATAL_HANDSHAKE: сервер не подтвердил конфигурацию";
+    if config.get_config {
+        events.error("handshake_timeout", message, true);
+    }
+    bail!(message)
 }
-
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-const KEEPALIVE_PACKET: [u8; 16] = [KEEPALIVE_BYTE; 16];
 
 async fn writer_loop(
     mut transport: TransportWriter,
@@ -681,79 +950,21 @@ async fn writer_loop(
     cancel: CancellationToken,
 ) -> Result<()> {
     let WriterRuntime {
-        normal,
-        small,
+        latency,
+        priority,
         bulk,
-        doomsday,
         mut commands,
-        mut path_probe,
-        unanswered_probes,
-        outstanding_probe,
-        stats,
-        initial_path_validation,
+        shutdown,
+        activity,
     } = runtime;
-    let mut schedule = 0;
-    let mut packets_since_command = WRITER_COMMAND_CHECK_PACKETS;
-    let mut validation_generation = crate::path_validation::generation();
-    let mut next_probe = Instant::now();
-    let mut validation_active = initial_path_validation && path_probe.is_some();
-    let mut validation_sent = false;
-    let jitter_ms = (rand::random::<u64>() % 4000) as u64;
-    let mut next_keepalive = Instant::now() + KEEPALIVE_INTERVAL + Duration::from_millis(jitter_ms);
     loop {
-        let now = Instant::now();
-        let current_generation = crate::path_validation::generation();
-        if current_generation != validation_generation {
-            validation_generation = current_generation;
-            unanswered_probes.store(0, Ordering::Release);
-            validation_active = path_probe.is_some();
-            validation_sent = false;
-            next_probe = now;
-        }
-        if validation_active && validation_sent && unanswered_probes.load(Ordering::Acquire) == 0 {
-            validation_active = false;
-        }
-        if validation_active && now >= next_probe {
-            reset_probe_misses_after_scheduler_stall(now, next_probe, &unanswered_probes, &stats);
-            send_path_probe(
-                &mut transport,
-                path_probe.as_deref_mut().unwrap_or_default(),
-                &unanswered_probes,
-                &outstanding_probe,
-                &stats,
-            )
-            .await?;
-            validation_sent = true;
-            next_probe = Instant::now() + PATH_PROBE_RECOVERY_INTERVAL;
-        }
-        if now >= next_keepalive {
-            let _ = transport.send_bytes(&KEEPALIVE_PACKET).await;
-            let jitter_ms = (rand::random::<u64>() % 4000) as u64;
-            next_keepalive = Instant::now() + KEEPALIVE_INTERVAL + Duration::from_millis(jitter_ms);
-        }
-        if packets_since_command >= WRITER_COMMAND_CHECK_PACKETS {
-            if let Ok(command) = commands.try_recv() {
-                handle_writer_command(&mut transport, command).await?;
-                packets_since_command = 0;
-                continue;
-            }
-            packets_since_command = 0;
-        }
-        if let Some(packet) = doomsday.try_recv() {
-            transport.send_data(packet).await?;
-            packets_since_command += 1;
+        if let Ok(command) = commands.try_recv() {
+            handle_writer_command(&mut transport, command).await?;
             continue;
         }
-
-        let packet = if let Some(packet) =
-            next_scheduled_packet(&normal, &small, &bulk, &mut schedule)
-        {
+        let next = if let Some(packet) = next_writer_packet(&latency, &priority, &bulk) {
             Some(packet)
-        } else if normal.is_closed()
-            && small.is_closed()
-            && bulk.is_closed()
-            && doomsday.is_closed()
-        {
+        } else if latency.is_closed() && priority.is_closed() && bulk.is_closed() {
             None
         } else {
             tokio::select! {
@@ -765,88 +976,80 @@ async fn writer_loop(
                     }
                     continue;
                 }
-                generation = crate::path_validation::changed(validation_generation) => {
-                    validation_generation = generation;
-                    unanswered_probes.store(0, Ordering::Release);
-                    validation_active = path_probe.is_some();
-                    validation_sent = false;
-                    next_probe = Instant::now();
-                    continue;
-                }
-                _ = tokio::time::sleep_until(next_probe.into()), if validation_active => continue,
-                _ = tokio::time::sleep_until(next_keepalive.into()) => continue,
-                packet = doomsday.recv(&cancel) => packet,
-                packet = small.recv(&cancel) => packet,
-                packet = normal.recv(&cancel) => packet,
-                packet = bulk.recv(&cancel) => packet,
+                packet = latency.recv(&cancel) => packet.map(|packet| WriterPacket {
+                    packet,
+                    class: PacketClass::Small,
+                }),
+                packet = priority.recv(&cancel) => packet.map(|packet| WriterPacket {
+                    packet,
+                    class: PacketClass::Medium,
+                }),
+                packet = bulk.recv(&cancel) => packet.map(|packet| WriterPacket {
+                    packet,
+                    class: PacketClass::Bulk,
+                }),
             }
         };
-        let Some(packet) = packet else {
+        let Some(next) = next else {
             if cancel.is_cancelled()
-                || (normal.is_closed()
-                    && small.is_closed()
-                    && bulk.is_closed()
-                    && doomsday.is_closed())
+                || (latency.is_closed() && priority.is_closed() && bulk.is_closed())
             {
                 return Ok(());
             }
             continue;
         };
-        transport.send_data(packet).await?;
-        packets_since_command += 1;
+        let sent = send_writer_batch(&mut transport, next, &latency, &priority, &bulk).await?;
+        if sent != 0 {
+            shutdown.mark_activity(&activity);
+        }
     }
 }
 
-async fn send_path_probe(
+async fn send_writer_batch(
     transport: &mut TransportWriter,
-    payload: &mut [u8],
-    unanswered_probes: &AtomicU8,
-    outstanding_probe: &AtomicU64,
-    stats: &Stats,
-) -> Result<()> {
-    let incremented =
-        unanswered_probes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < PATH_PROBE_MISS_LIMIT).then_some(count + 1)
-        });
-    let Ok(previous) = incremented else {
-        stats.path_unresponsive.fetch_add(1, Ordering::Relaxed);
-        bail!("PATH_UNRESPONSIVE: server did not acknowledge path probes");
+    first: WriterPacket,
+    latency: &PacketReceiver,
+    priority: &PacketReceiver,
+    bulk: &PacketReceiver,
+) -> Result<usize> {
+    client_perf::observe(PerfStage::WriterBatch);
+    let (receiver, limit) = match first.class {
+        PacketClass::Small => (latency, WRITER_LATENCY_BATCH_LIMIT),
+        PacketClass::Medium => (priority, WRITER_PRIORITY_BATCH_LIMIT),
+        PacketClass::Bulk => (bulk, WRITER_BULK_BATCH_LIMIT),
     };
-    if previous > 0 {
-        stats.path_probe_misses.fetch_add(1, Ordering::Relaxed);
-    }
-    let previous_sequence = outstanding_probe
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.wrapping_add(1).max(1))
-        })
-        .unwrap_or_default();
-    let sequence = previous_sequence.wrapping_add(1).max(1);
-    payload[31..39].copy_from_slice(&sequence.to_be_bytes());
-    match transport.send_bytes(payload).await {
-        Ok(()) => {
-            stats.path_probes_sent.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+    transport.queue_data(first.packet);
+    let mut sent = 1usize;
+    while sent < limit {
+        if !writer_batch_can_extend(
+            first.class,
+            latency.has_queued_packet(),
+            priority.has_queued_packet(),
+        ) {
+            break;
         }
-        Err(error) => {
-            stats.path_probe_send_errors.fetch_add(1, Ordering::Relaxed);
-            Err(error)
+        if let Some(packet) = receiver.try_recv() {
+            transport.queue_data(packet);
+            sent += 1;
+        } else {
+            break;
         }
     }
+    transport.flush_queued_data().await?;
+    Ok(sent)
 }
 
-fn reset_probe_misses_after_scheduler_stall(
-    now: Instant,
-    deadline: Instant,
-    unanswered_probes: &AtomicU8,
-    stats: &Stats,
+#[inline]
+fn writer_batch_can_extend(
+    class: PacketClass,
+    latency_pending: bool,
+    priority_pending: bool,
 ) -> bool {
-    if now.saturating_duration_since(deadline) < PATH_PROBE_SCHEDULER_STALL {
-        return false;
+    match class {
+        PacketClass::Small => true,
+        PacketClass::Medium => !latency_pending,
+        PacketClass::Bulk => !latency_pending && !priority_pending,
     }
-    if unanswered_probes.swap(0, Ordering::AcqRel) > 0 {
-        stats.path_scheduler_resets.fetch_add(1, Ordering::Relaxed);
-    }
-    true
 }
 
 async fn handle_writer_command(
@@ -865,34 +1068,37 @@ async fn handle_writer_command(
 async fn send_writer_bytes(sender: &mpsc::Sender<WriterCommand>, data: &[u8]) -> Result<()> {
     let (completion, result) = oneshot::channel();
     sender
-        .send(WriterCommand::SendBytes {
-            data: Box::from(data),
+        .try_send(WriterCommand::SendBytes {
+            data: Bytes::copy_from_slice(data),
             completion,
         })
-        .await
         .context("writer command queue closed")?;
     result.await.context("writer command response closed")?
 }
 
-fn next_scheduled_packet(
-    normal: &PacketReceiver,
-    small: &PacketReceiver,
+fn next_writer_packet(
+    latency: &PacketReceiver,
+    priority: &PacketReceiver,
     bulk: &PacketReceiver,
-    schedule: &mut usize,
-) -> Option<PacketBuf> {
-    for _ in 0..WRITER_SCHEDULE.len() {
-        let class = WRITER_SCHEDULE[*schedule % WRITER_SCHEDULE.len()];
-        *schedule = (*schedule).wrapping_add(1);
-        let packet = match class {
-            0 => normal.try_recv(),
-            1 => small.try_recv(),
-            _ => bulk.try_recv(),
-        };
-        if packet.is_some() {
-            return packet;
-        }
-    }
-    None
+) -> Option<WriterPacket> {
+    latency
+        .try_recv()
+        .map(|packet| WriterPacket {
+            packet,
+            class: PacketClass::Small,
+        })
+        .or_else(|| {
+            priority.try_recv().map(|packet| WriterPacket {
+                packet,
+                class: PacketClass::Medium,
+            })
+        })
+        .or_else(|| {
+            bulk.try_recv().map(|packet| WriterPacket {
+                packet,
+                class: PacketClass::Bulk,
+            })
+        })
 }
 
 async fn reader_loop(
@@ -902,11 +1108,10 @@ async fn reader_loop(
 ) -> Result<()> {
     let ReaderRuntime {
         dispatcher,
-        unanswered_probes,
-        outstanding_probe,
-        stats,
         events,
-        worker_id,
+        repair,
+        shutdown,
+        config_tx,
     } = runtime;
     loop {
         let packet = tokio::select! {
@@ -914,25 +1119,33 @@ async fn reader_loop(
             _ = cancel.cancelled() => return Ok(()),
             result = transport.recv() => result?,
         };
-        let is_legacy_ack = is_keepalive(packet.as_slice());
-        let is_current_ack = parse_path_ack(packet.as_slice()).is_some_and(|(worker, sequence)| {
-            usize::from(worker) == worker_id
-                && sequence != 0
-                && sequence == outstanding_probe.load(Ordering::Acquire)
-        });
-        let is_path_ack = is_legacy_ack || is_current_ack;
-        if is_path_ack || (!packet.as_slice().starts_with(PATH_RECEIPT_ACK)) {
-            unanswered_probes.store(0, Ordering::Release);
-        }
-        if is_path_ack {
-            stats.path_probe_acks.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if packet.as_slice().starts_with(PATH_RECEIPT_ACK) {
-            continue;
-        }
         if is_panel_restart_notice(packet.as_slice()) {
             events.panel_restart();
+            continue;
+        }
+        if let Some(command) = parse_stream_repair(packet.as_slice()) {
+            let result = repair.apply_repair(&command);
+            if result.restarts != 0 {
+                crate::log_error!(
+                    "[REPAIR] Сервер запросил перезапуск потоков {:?}, sequence {}, resets {}",
+                    command.worker_ids,
+                    command.sequence,
+                    result.credential_resets
+                );
+            }
+            continue;
+        }
+        if let Some(command) = parse_stream_alive(packet.as_slice()) {
+            repair.apply_alive(&command);
+            continue;
+        }
+        if shutdown.observe_control_response(packet.as_slice()) {
+            continue;
+        }
+        if packet.as_slice().starts_with(b"TUNCONF:") {
+            if let Ok(ConfigResponse::Config(config)) = parse_config_response(packet.as_slice()) {
+                let _ = config_tx.try_send(config);
+            }
             continue;
         }
         if is_control_response(packet.as_slice()) {
@@ -946,85 +1159,42 @@ fn deliver_inbound_packet(dispatcher: &Dispatcher, packet: PacketBuf) {
     dispatcher.return_packet(packet);
 }
 
-fn is_keepalive(packet: &[u8]) -> bool {
-    !packet.is_empty() && packet.iter().all(|byte| *byte == KEEPALIVE_BYTE)
-}
-
-fn smart_ping_payload(device_id: &str, generation: u64, worker_id: usize) -> Option<Box<[u8]>> {
-    let device = device_id.as_bytes();
-    let worker_id = u16::try_from(worker_id).ok()?;
-    if device.is_empty() || device.len() > 16 || worker_id == 0 || worker_id > 162 {
-        return None;
-    }
-    let mut payload = vec![KEEPALIVE_BYTE; PATH_PROBE_BYTES];
-    payload[1..17].fill(0);
-    payload[1..1 + device.len()].copy_from_slice(device);
-    payload[17..25].copy_from_slice(&generation.to_be_bytes());
-    payload[25..29].copy_from_slice(PATH_PROBE_V2_MAGIC);
-    payload[29..31].copy_from_slice(&worker_id.to_be_bytes());
-    payload[31..39].fill(0);
-    Some(payload.into_boxed_slice())
-}
-
-fn parse_path_ack(payload: &[u8]) -> Option<(u16, u64)> {
-    if payload.len() != PATH_RECEIPT_ACK.len() + 10 || !payload.starts_with(PATH_RECEIPT_ACK) {
-        return None;
-    }
-    let offset = PATH_RECEIPT_ACK.len();
-    let worker = u16::from_be_bytes(payload[offset..offset + 2].try_into().ok()?);
-    let sequence = u64::from_be_bytes(payload[offset + 2..offset + 10].try_into().ok()?);
-    Some((worker, sequence))
-}
-
 fn turn_endpoint_index(id: usize, cursor: usize, endpoint_count: usize) -> usize {
     debug_assert!(endpoint_count > 0);
     (id % endpoint_count + cursor % endpoint_count) % endpoint_count
 }
 
-fn override_turn_address(address: &str, host: Option<&str>, port: Option<&str>) -> Result<String> {
-    let address = address.trim();
-    let lower = address.to_ascii_lowercase();
-    if lower.starts_with("turns:") {
-        bail!("TURN TLS endpoint cannot be used by UDP transport");
-    }
-    let address = if lower.starts_with("turn:") {
-        &address["turn:".len()..]
-    } else {
-        address
-    };
-    let (clean, query) = address.split_once('?').unwrap_or((address, ""));
-    for parameter in query.split('&').filter(|parameter| !parameter.is_empty()) {
-        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-        if key.eq_ignore_ascii_case("transport") && !value.eq_ignore_ascii_case("udp") {
-            bail!("non-UDP TURN endpoint rejected");
+fn select_turn_address<'a>(addresses: &'a [Arc<str>], config: &SessionConfig) -> Result<&'a str> {
+    let count = addresses.len();
+    let start = turn_endpoint_index(config.id, config.turn_endpoint_cursor, count);
+    for offset in 0..count {
+        let address = addresses[(start + offset) % count].as_ref();
+        if resolve_turn_endpoints(
+            address,
+            config.turn_host.as_deref(),
+            config.turn_port.as_deref(),
+            config.turn_transport,
+        )
+        .is_ok()
+        {
+            return Ok(address);
         }
     }
-    let (original_host, original_port) =
-        split_host_port(clean).with_context(|| format!("СЂР°Р·Р±РѕСЂ TURN URL {address:?}"))?;
-    let selected_host = host
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| original_host.to_owned());
-    let selected_port = port
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| original_port.to_owned());
-    if selected_host.contains(':') && !selected_host.starts_with('[') {
-        Ok(format!("[{selected_host}]:{selected_port}"))
-    } else {
-        Ok(format!("{selected_host}:{selected_port}"))
-    }
+    bail!("Нет TURN endpoint для выбранного транспорта")
 }
 
-fn split_host_port(address: &str) -> Result<(&str, &str)> {
-    if let Some(rest) = address.strip_prefix('[') {
-        return rest
-            .split_once("]:")
-            .ok_or_else(|| anyhow!("IPv6 TURN address has no port"));
-    }
-    address
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("TURN address has no port"))
+fn turn_path_key(address: &str, config: &SessionConfig) -> Result<Arc<str>> {
+    let endpoint = resolve_turn_endpoints(
+        address,
+        config.turn_host.as_deref(),
+        config.turn_port.as_deref(),
+        config.turn_transport,
+    )
+    .context("TURN endpoint is invalid")?
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow!("TURN endpoint list is empty"))?;
+    Ok(Arc::from(endpoint.socket_authority()))
 }
 
 #[cfg(test)]
@@ -1036,25 +1206,128 @@ mod tests {
     use std::future::pending;
 
     #[test]
-    fn udp_session_rejects_tls_and_tcp_turn_endpoints_defensively() {
-        assert!(override_turn_address("turns:relay.example:5349", None, None).is_err());
-        assert!(
-            override_turn_address(
-                "turn:relay.example:3478?transport=tcp",
-                Some("override.example"),
-                Some("3478"),
-            )
-            .is_err()
-        );
+    fn transport_selection_skips_incompatible_turn_endpoints() {
+        let addresses: Arc<[Arc<str>]> = [
+            Arc::from("turn:relay.example:3478?transport=udp"),
+            Arc::from("turn:relay.example:3478?transport=tcp"),
+        ]
+        .into();
+        let config = SessionConfig {
+            id: 0,
+            peer: "127.0.0.1:46000".parse().unwrap(),
+            turn_host: None,
+            turn_port: None,
+            turn_transport: TurnTransportMode::TcpTls,
+            local_port: Arc::from("9000"),
+            device_id: Arc::from("device"),
+            password: Arc::from("password"),
+            generation: 0,
+            turn_endpoint_cursor: 0,
+            salt: Arc::from(""),
+            mode: ObfsMode::Audio,
+            wrap_key: [0; 32],
+            get_config: false,
+            desired_count: 18,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
+            repair: RepairState::new(18),
+        };
         assert_eq!(
-            override_turn_address(
-                "turn:relay.example:3478?transport=udp",
-                Some("override.example"),
-                Some("19302"),
-            )
-            .unwrap(),
-            "override.example:19302"
+            select_turn_address(&addresses, &config).unwrap(),
+            "turn:relay.example:3478?transport=tcp"
         );
+    }
+
+    #[test]
+    fn first_registration_announces_the_full_stream_set_before_the_feature_reply() {
+        let config = SessionConfig {
+            id: 1,
+            peer: "127.0.0.1:46000".parse().unwrap(),
+            turn_host: None,
+            turn_port: None,
+            turn_transport: TurnTransportMode::Udp,
+            local_port: Arc::from("9000"),
+            device_id: Arc::from("device"),
+            password: Arc::from("password"),
+            generation: 7,
+            turn_endpoint_cursor: 0,
+            salt: Arc::from("generation-id"),
+            mode: ObfsMode::Audio,
+            wrap_key: [0; 32],
+            get_config: true,
+            desired_count: 9,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
+            repair: RepairState::new(9),
+        };
+        assert_eq!(
+            build_registration_payload(&config).as_ref(),
+            b"GETCONF:9000|device|password|7|generation-id|1|9|CSQTT-WIRE-3"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_uses_the_most_recently_active_control_stream_once() {
+        let shutdown = Arc::new(ShutdownCoordinator::new());
+        let (older_tx, mut older_rx) = mpsc::channel(1);
+        let older = shutdown.register(1, older_tx);
+        let (newer_tx, mut newer_rx) = mpsc::channel(1);
+        let newer = shutdown.register(2, newer_tx);
+        shutdown.mark_activity(&older.activity);
+
+        let coordinator = shutdown.clone();
+        let task = tokio::spawn(async move {
+            coordinator.request_disconnect("device", "salt").await;
+        });
+        let command = tokio::time::timeout(Duration::from_millis(100), older_rx.recv())
+            .await
+            .unwrap_or(None);
+        let completion = match command {
+            Some(WriterCommand::SendBytes { data, completion }) => {
+                assert_eq!(data.as_ref(), b"DISCONNECT:device|salt");
+                completion
+            }
+            None => panic!("shutdown did not select the active control stream"),
+        };
+        assert!(completion.send(Ok(())).is_ok());
+        assert!(shutdown.observe_control_response(b"OK:disconnected"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .is_ok()
+        );
+        assert!(newer_rx.try_recv().is_err());
+        drop(older);
+        drop(newer);
+    }
+
+    #[tokio::test]
+    async fn shutdown_never_uses_a_dropped_control_stream() {
+        let shutdown = Arc::new(ShutdownCoordinator::new());
+        let (stale_tx, mut stale_rx) = mpsc::channel(1);
+        let stale = shutdown.register(1, stale_tx);
+        drop(stale);
+        let (active_tx, mut active_rx) = mpsc::channel(1);
+        let active = shutdown.register(2, active_tx);
+
+        let coordinator = shutdown.clone();
+        let task = tokio::spawn(async move {
+            coordinator.request_disconnect("device", "salt").await;
+        });
+        let command = tokio::time::timeout(Duration::from_millis(100), active_rx.recv())
+            .await
+            .unwrap_or(None);
+        let completion = match command {
+            Some(WriterCommand::SendBytes { completion, .. }) => completion,
+            None => panic!("shutdown did not select a live control stream"),
+        };
+        assert!(completion.send(Ok(())).is_ok());
+        assert!(shutdown.observe_control_response(b"OK:disconnected"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .is_ok()
+        );
+        assert!(stale_rx.try_recv().is_err());
+        drop(active);
     }
 
     #[derive(Clone, Copy, Default)]
@@ -1220,12 +1493,12 @@ mod tests {
     }
 
     #[test]
-    fn weighted_writer_schedule_prevents_class_starvation() {
+    fn writer_drains_latency_before_bulk() {
         let pool = PacketPool::new(512);
-        let (normal_tx, normal) = packet_channel(256, Duration::from_secs(1), true);
-        let (small_tx, small) = packet_channel(256, Duration::from_secs(1), true);
-        let (bulk_tx, bulk) = packet_channel(256, Duration::from_secs(1), true);
-        for (sender, class) in [(&normal_tx, 0), (&small_tx, 1), (&bulk_tx, 2)] {
+        let (latency_tx, latency) = packet_channel(256, true);
+        let (priority_tx, priority) = packet_channel(256, true);
+        let (bulk_tx, bulk) = packet_channel(256, true);
+        for (sender, class) in [(&latency_tx, 0), (&priority_tx, 1), (&bulk_tx, 2)] {
             for _ in 0..160 {
                 let mut packet = pool.acquire();
                 packet.set_read_len(1).unwrap();
@@ -1233,53 +1506,100 @@ mod tests {
                 assert!(sender.try_send(packet).is_ok());
             }
         }
-        let mut schedule = 0;
-        let mut counts = [0usize; 3];
-        let mut last_seen = [None; 3];
-        for position in 0usize..160 {
-            let packet = next_scheduled_packet(&normal, &small, &bulk, &mut schedule).unwrap();
-            let class = packet.as_slice()[0] as usize;
-            counts[class] += 1;
-            if let Some(previous) = last_seen[class] {
-                let bound = if class == 2 { 2 } else { 4 };
-                assert!(position - previous <= bound);
-            }
-            last_seen[class] = Some(position);
+        for _ in 0..160 {
+            let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
+            assert_eq!(packet.packet.as_slice()[0], 0);
+            assert_eq!(packet.class, PacketClass::Small);
         }
-        assert_eq!(counts, [40, 40, 80]);
+        let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
+        assert_eq!(packet.packet.as_slice()[0], 1);
+        assert_eq!(packet.class, PacketClass::Medium);
+        for _ in 1..160 {
+            assert_eq!(
+                next_writer_packet(&latency, &priority, &bulk)
+                    .unwrap()
+                    .class,
+                PacketClass::Medium
+            );
+        }
+        let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
+        assert_eq!(packet.packet.as_slice()[0], 2);
+        assert_eq!(packet.class, PacketClass::Bulk);
     }
 
     #[test]
-    fn bulk_queue_saturates_before_packets_can_age_out_on_a_ten_megabit_path() {
+    fn worker_queues_hold_one_full_mmsg_batch_per_data_lane() {
         const TUN_MTU: u128 = 1_300;
-        const BITS_PER_SECOND: u128 = 10_000_000;
-        let allowed_buffered_bits =
-            WORKER_BULK_CAPACITY as u128 * TUN_MTU * 8 * 1_000_000 / BITS_PER_SECOND;
-        assert!(allowed_buffered_bits < WORKER_QUEUE_MAX_AGE.as_micros());
-        assert_eq!(WORKER_BULK_CAPACITY, 256);
+        const BITS_PER_SECOND: u128 = 2_000_000;
+        let buffered_us = WORKER_BULK_CAPACITY as u128 * TUN_MTU * 8 * 1_000_000 / BITS_PER_SECOND;
+        assert!(buffered_us <= 700_000);
+        assert_eq!(
+            WORKER_LATENCY_CAPACITY,
+            crate::striped_scheduler::SMALL_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WORKER_PRIORITY_CAPACITY,
+            crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WORKER_BULK_CAPACITY,
+            crate::striped_scheduler::BULK_DATAGRAM_BATCH
+        );
     }
 
     #[test]
-    fn sustained_simultaneous_queues_keep_half_of_send_slots_for_bulk() {
-        let pool = PacketPool::new(2_400);
-        let (normal_tx, normal) = packet_channel(800, Duration::from_secs(60), true);
-        let (small_tx, small) = packet_channel(800, Duration::from_secs(60), true);
-        let (bulk_tx, bulk) = packet_channel(800, Duration::from_secs(60), true);
-        for (sender, class) in [(&normal_tx, 0), (&small_tx, 1), (&bulk_tx, 2)] {
-            for _ in 0..800 {
-                let mut packet = pool.acquire();
-                packet.set_read_len(1).unwrap();
-                packet.as_mut_slice()[0] = class;
-                assert!(sender.try_send(packet).is_ok());
-            }
+    fn writer_uses_bulk_when_latency_is_empty() {
+        let pool = PacketPool::new(4);
+        let (latency_tx, latency) = packet_channel(800, true);
+        let (priority_tx, priority) = packet_channel(800, true);
+        let (bulk_tx, bulk) = packet_channel(800, true);
+        drop(latency_tx);
+        drop(priority_tx);
+        let mut packet = pool.acquire();
+        packet.set_read_len(1).unwrap();
+        packet.as_mut_slice()[0] = 1;
+        assert!(bulk_tx.try_send(packet).is_ok());
+        let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
+        assert_eq!(packet.packet.as_slice()[0], 1);
+        assert_eq!(packet.class, PacketClass::Bulk);
+    }
+
+    #[test]
+    fn writer_prefers_latency_when_both_queues_ready() {
+        let pool = PacketPool::new(4);
+        let (latency_tx, latency) = packet_channel(4, true);
+        let (priority_tx, priority) = packet_channel(4, true);
+        let (bulk_tx, bulk) = packet_channel(4, true);
+        for (sender, class) in [(&latency_tx, 0), (&priority_tx, 1), (&bulk_tx, 2)] {
+            let mut packet = pool.acquire();
+            packet.set_read_len(1).unwrap();
+            packet.as_mut_slice()[0] = class;
+            assert!(sender.try_send(packet).is_ok());
         }
-        let mut schedule = 0;
-        let mut counts = [0usize; 3];
-        for _ in 0..800 {
-            let packet = next_scheduled_packet(&normal, &small, &bulk, &mut schedule).unwrap();
-            counts[packet.as_slice()[0] as usize] += 1;
-        }
-        assert_eq!(counts, [200, 200, 400]);
+        let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
+        assert_eq!(packet.packet.as_slice()[0], 0);
+        assert_eq!(packet.class, PacketClass::Small);
+    }
+
+    #[test]
+    fn writer_batches_respect_priority_lanes() {
+        assert_eq!(
+            WRITER_LATENCY_BATCH_LIMIT,
+            crate::striped_scheduler::SMALL_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WRITER_PRIORITY_BATCH_LIMIT,
+            crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WRITER_BULK_BATCH_LIMIT,
+            crate::striped_scheduler::BULK_DATAGRAM_BATCH
+        );
+        assert!(writer_batch_can_extend(PacketClass::Medium, false, true));
+        assert!(!writer_batch_can_extend(PacketClass::Medium, true, false));
+        assert!(writer_batch_can_extend(PacketClass::Bulk, false, false));
+        assert!(!writer_batch_can_extend(PacketClass::Bulk, true, false));
+        assert!(!writer_batch_can_extend(PacketClass::Bulk, false, true));
     }
 
     #[test]
@@ -1567,29 +1887,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn keepalive_requires_a_nonempty_all_ff_payload() {
-        assert!(is_keepalive(&[0xff; 32]));
-        assert!(!is_keepalive(&[]));
-        assert!(!is_keepalive(&[0xff, 0x00, 0xff]));
-    }
-
-    #[test]
-    fn smart_ping_matches_server_wire_contract() {
-        let payload = smart_ping_payload("0123456789abcdef", 42, 162).unwrap();
-        assert_eq!(payload.len(), 45);
-        assert_eq!(&payload[1..17], b"0123456789abcdef");
-        assert_eq!(&payload[17..25], &42u64.to_be_bytes());
-        assert_eq!(&payload[25..29], PATH_PROBE_V2_MAGIC);
-        assert_eq!(&payload[29..31], &162u16.to_be_bytes());
-        assert_eq!(&payload[31..39], &[0; 8]);
-        assert!(payload[39..].iter().all(|byte| *byte == 0xff));
-        assert!(smart_ping_payload("", 42, 1).is_none());
-        assert!(smart_ping_payload("0123456789abcdef0", 42, 1).is_none());
-        assert!(smart_ping_payload("0123456789abcdef", 42, 0).is_none());
-        assert!(smart_ping_payload("0123456789abcdef", 42, 163).is_none());
-    }
-
     #[tokio::test]
     async fn cancellation_waits_for_graceful_session_exit() {
         let cancel = CancellationToken::new();
@@ -1618,66 +1915,9 @@ mod tests {
     }
 
     #[test]
-    fn path_ack_requires_exact_wire_shape() {
-        let mut ack = PATH_RECEIPT_ACK.to_vec();
-        ack.extend_from_slice(&17u16.to_be_bytes());
-        ack.extend_from_slice(&91u64.to_be_bytes());
-        assert_eq!(parse_path_ack(&ack), Some((17, 91)));
-        ack.push(0);
-        assert_eq!(parse_path_ack(&ack), None);
-    }
-
-    #[tokio::test]
-    async fn path_probe_requires_three_full_unanswered_intervals_before_failure() {
-        let misses = AtomicU8::new(0);
-        for expected in 1..=PATH_PROBE_MISS_LIMIT {
-            let updated = misses.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < PATH_PROBE_MISS_LIMIT).then_some(count + 1)
-            });
-            assert!(updated.is_ok());
-            assert_eq!(misses.load(Ordering::Acquire), expected);
-        }
-        assert!(
-            misses
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    (count < PATH_PROBE_MISS_LIMIT).then_some(count + 1)
-                })
-                .is_err()
-        );
-        misses.store(0, Ordering::Release);
-        assert_eq!(misses.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn scheduler_stall_discards_old_probe_misses() {
-        let misses = AtomicU8::new(PATH_PROBE_MISS_LIMIT);
-        let stats = Stats::default();
-        let deadline = Instant::now();
-
-        assert!(!reset_probe_misses_after_scheduler_stall(
-            deadline + PATH_PROBE_SCHEDULER_STALL - Duration::from_millis(1),
-            deadline,
-            &misses,
-            &stats,
-        ));
-        assert_eq!(misses.load(Ordering::Acquire), PATH_PROBE_MISS_LIMIT);
-        assert_eq!(stats.path_scheduler_resets.load(Ordering::Acquire), 0);
-
-        assert!(reset_probe_misses_after_scheduler_stall(
-            deadline + PATH_PROBE_SCHEDULER_STALL,
-            deadline,
-            &misses,
-            &stats,
-        ));
-        assert_eq!(misses.load(Ordering::Acquire), 0);
-        assert_eq!(stats.path_scheduler_resets.load(Ordering::Acquire), 1);
-        assert_eq!(PATH_PROBE_RECOVERY_INTERVAL, Duration::from_secs(1));
-    }
-
-    #[test]
     fn endpoint_rotation_is_local_cyclic_and_overflow_safe() {
         for endpoint_count in 1..=8 {
-            for id in 1..=162 {
+            for id in 1..=126 {
                 let selected = (0..endpoint_count)
                     .map(|cursor| turn_endpoint_index(id, cursor, endpoint_count))
                     .collect::<std::collections::HashSet<_>>();

@@ -18,7 +18,6 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -66,12 +65,10 @@ internal data class DeployUiState(
     val host: String = "",
     val sshLogin: String = "",
     val sshPassword: String = "",
-    val primaryDns: String = "1.1.1.1",
-    val secondaryDns: String = "1.0.0.1",
     val manualPorts: Boolean = false,
-    val sshPort: String = "22",
-    val peerPort: String = "46000",
-    val webPort: String = "46002",
+    val sshPort: String = CsqttConstants.Network.DEFAULT_SSH_PORT.toString(),
+    val peerPort: String = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString(),
+    val webPort: String = CsqttConstants.Network.DEFAULT_SERVER_WEB_PORT.toString(),
     val mainPasswordConfigured: Boolean = false,
     val webPanelConfigured: Boolean = false,
     val sshKeysMode: Boolean = false,
@@ -102,8 +99,6 @@ internal sealed interface DeployAction {
     data class HostChanged(val value: String) : DeployAction
     data class LoginChanged(val value: String) : DeployAction
     data class PasswordChanged(val value: String) : DeployAction
-    data class PrimaryDnsChanged(val value: String) : DeployAction
-    data class SecondaryDnsChanged(val value: String) : DeployAction
     data class ManualPortsChanged(val enabled: Boolean) : DeployAction
     data class SshKeysModeChanged(val enabled: Boolean) : DeployAction
     data class DockerInstallChanged(val enabled: Boolean) : DeployAction
@@ -119,7 +114,40 @@ internal sealed interface DeployAction {
     data object PanelInfo : DeployAction
 }
 
+internal fun passwordToSynchronizeAfterDeploy(deploySucceeded: Boolean, mainPassword: String): String? =
+    mainPassword.takeIf { deploySucceeded && it.isNotBlank() }
+
 internal fun isValidPort(value: String): Boolean = value.toIntOrNull() in 1..65535
+
+@Immutable
+internal data class EffectiveServerPorts(
+    val ssh: Int,
+    val peer: Int,
+    val web: Int,
+)
+
+internal fun resolveServerPorts(
+    manualPorts: Boolean,
+    sshPort: String,
+    peerPort: String,
+    webPort: String,
+): EffectiveServerPorts {
+    if (!manualPorts) {
+        return EffectiveServerPorts(
+            ssh = CsqttConstants.Network.DEFAULT_SSH_PORT,
+            peer = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT,
+            web = CsqttConstants.Network.DEFAULT_SERVER_WEB_PORT,
+        )
+    }
+    return EffectiveServerPorts(
+        ssh = sshPort.toIntOrNull()?.takeIf { it in 1..65535 }
+            ?: CsqttConstants.Network.DEFAULT_SSH_PORT,
+        peer = peerPort.toIntOrNull()?.takeIf { it in 1..65535 }
+            ?: CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT,
+        web = webPort.toIntOrNull()?.takeIf { it in 1..65535 }
+            ?: CsqttConstants.Network.DEFAULT_SERVER_WEB_PORT,
+    )
+}
 
 internal fun hasWebPanelCredentials(login: String, password: String): Boolean =
     login.isNotBlank() && password.isNotBlank()
@@ -148,8 +176,6 @@ internal fun DeployTab(
     val savedPassword = savedSettings.sshPassword
     val savedWebLogin = savedSettings.webLogin
     val savedWebPassword = savedSettings.webPassword
-    val savedDns1 = savedSettings.primaryDns
-    val savedDns2 = savedSettings.secondaryDns
     val savedMainPass = savedSettings.mainPassword
     val savedSshPort = savedSettings.sshPort
     val savedManualPorts = savedSettings.manualPortsEnabled
@@ -167,9 +193,9 @@ internal fun DeployTab(
     var host by rememberSaveable(savedSettings.profile) { mutableStateOf(savedIp) }
     var sshLogin by rememberSaveable(savedSettings.profile) { mutableStateOf(savedLogin) }
     var sshPassword by rememberSaveable(savedSettings.profile) { mutableStateOf(savedPassword) }
-    var primaryDns by rememberSaveable(savedSettings.profile) { mutableStateOf(savedDns1) }
-    var secondaryDns by rememberSaveable(savedSettings.profile) { mutableStateOf(savedDns2) }
-    var sshPort by rememberSaveable(savedSettings.profile) { mutableStateOf(savedSshPort.ifBlank { "22" }) }
+    var sshPort by rememberSaveable(savedSettings.profile) {
+        mutableStateOf(savedSshPort.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() })
+    }
     var peerPort by rememberSaveable(savedSettings.profile) { mutableStateOf(savedServerPeerPort.toString()) }
     var webPort by rememberSaveable(savedSettings.profile) { mutableStateOf(savedServerWebPort.toString()) }
     var dockerInstall by rememberSaveable(savedSettings.profile) { mutableStateOf(savedDockerInstall) }
@@ -183,11 +209,9 @@ internal fun DeployTab(
     var showSshKeysDialog by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
     var showDockerInfoDialog by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
 
-    LaunchedEffect(savedSettings.profile, savedIp, savedDns1, savedDns2) {
+    LaunchedEffect(savedSettings.profile, savedIp) {
         if (!generalEdited) {
             host = savedIp
-            primaryDns = savedDns1
-            secondaryDns = savedDns2
         }
     }
     LaunchedEffect(savedSettings.profile, savedLogin, savedPassword) {
@@ -198,7 +222,7 @@ internal fun DeployTab(
     }
     LaunchedEffect(savedSettings.profile, savedSshPort, savedServerPeerPort, savedServerWebPort) {
         if (!portsEdited) {
-            sshPort = savedSshPort.ifBlank { "22" }
+            sshPort = savedSshPort.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() }
             peerPort = savedServerPeerPort.toString()
             webPort = savedServerWebPort.toString()
         }
@@ -207,10 +231,10 @@ internal fun DeployTab(
         dockerInstall = savedDockerInstall
     }
 
-    LaunchedEffect(savedSettings.profile, host, primaryDns, secondaryDns, generalEdited) {
+    LaunchedEffect(savedSettings.profile, host, generalEdited) {
         if (!generalEdited) return@LaunchedEffect
         kotlinx.coroutines.delay(450)
-        settingsStore.saveDeploy(host, primaryDns, secondaryDns)
+        settingsStore.saveDeploy(host)
     }
     LaunchedEffect(savedSettings.profile, sshLogin, sshPassword, credentialsEdited, savedMainPass, savedWebLogin, savedWebPassword) {
         if (!credentialsEdited) return@LaunchedEffect
@@ -232,8 +256,6 @@ internal fun DeployTab(
         host = host,
         sshLogin = sshLogin,
         sshPassword = sshPassword,
-        primaryDns = primaryDns,
-        secondaryDns = secondaryDns,
         manualPorts = savedManualPorts,
         sshPort = sshPort,
         peerPort = peerPort,
@@ -251,15 +273,16 @@ internal fun DeployTab(
 
     fun startDeploy() {
         if (DeployManager.isDeploying.value) return
-        val effectiveSshPort = sshPort.toIntOrNull() ?: 22
-        val effectivePeerPort = if (savedManualPorts) peerPort.toIntOrNull() ?: 46000 else 46000
-        val effectiveWebPort = if (savedManualPorts) webPort.toIntOrNull() ?: 46002 else 46002
+        val ports = resolveServerPorts(savedManualPorts, sshPort, peerPort, webPort)
+        val effectiveSshPort = ports.ssh
+        val effectivePeerPort = ports.peer
+        val effectiveWebPort = ports.web
         val deployPrivateKey = if (savedSshKeysMode) savedSshPrivateKey else ""
         val deployKeyPassphrase = if (savedSshKeysMode) savedSshKeyPassphrase else ""
         val deployCertificate = if (savedSshKeysMode) savedSshCertificate else ""
         val deployPassword = if (savedSshKeysMode) "" else sshPassword
         scope.launch {
-            settingsStore.saveDeploy(host, primaryDns, secondaryDns)
+            settingsStore.saveDeploy(host)
             settingsStore.saveDeploySecrets(savedMainPass, sshLogin, sshPassword, savedWebLogin, savedWebPassword)
             settingsStore.savePorts(effectivePeerPort, effectiveWebPort, effectiveSshPort.toString())
         }
@@ -278,8 +301,6 @@ internal fun DeployTab(
                     webPass = savedWebPassword,
                     peerPort = effectivePeerPort,
                     webPort = effectiveWebPort,
-                    dns1 = primaryDns,
-                    dns2 = secondaryDns,
                     onProgress = DeployManager::updateProgress,
                     privateKey = deployPrivateKey,
                     keyPassphrase = deployKeyPassphrase,
@@ -287,6 +308,10 @@ internal fun DeployTab(
                     installInDocker = dockerInstall,
                 )
                 if (success) {
+                    passwordToSynchronizeAfterDeploy(success, savedMainPass)?.let { mainPassword ->
+                        settingsStore.saveConnectionPassword(mainPassword)
+                        TunnelManager.addDeployInfoLog("Пароль подключения синхронизирован с паролем сервера")
+                    }
                     showDeployToast(context, "Установка успешно завершена")
                 } else {
                     val message = DeployManager.lastResult.value.ifBlank { "Ошибка установки" }
@@ -314,8 +339,9 @@ internal fun DeployTab(
 
     fun startUninstall() {
         if (DeployManager.isDeploying.value) return
-        val effectiveSshPort = sshPort.toIntOrNull() ?: 22
-        val effectivePeerPort = if (savedManualPorts) peerPort.toIntOrNull() ?: 46000 else 46000
+        val ports = resolveServerPorts(savedManualPorts, sshPort, peerPort, webPort)
+        val effectiveSshPort = ports.ssh
+        val effectivePeerPort = ports.peer
         val uninstallPrivateKey = if (savedSshKeysMode) savedSshPrivateKey else ""
         val uninstallKeyPassphrase = if (savedSshKeysMode) savedSshKeyPassphrase else ""
         val uninstallCertificate = if (savedSshKeysMode) savedSshCertificate else ""
@@ -376,19 +402,17 @@ internal fun DeployTab(
                     credentialsEdited = true
                 }
                 is DeployAction.PasswordChanged -> {
-                    sshPassword = action.value.filterNot(Char::isWhitespace)
+                    sshPassword = sanitizeSshPassword(action.value)
                     credentialsEdited = true
                 }
-                is DeployAction.PrimaryDnsChanged -> {
-                    primaryDns = action.value.filterNot(Char::isWhitespace)
-                    generalEdited = true
-                }
-                is DeployAction.SecondaryDnsChanged -> {
-                    secondaryDns = action.value.filterNot(Char::isWhitespace)
-                    generalEdited = true
-                }
-                is DeployAction.ManualPortsChanged -> scope.launch {
-                    settingsStore.saveManualPortsEnabled(action.enabled)
+                is DeployAction.ManualPortsChanged -> {
+                    if (!action.enabled) {
+                        sshPort = CsqttConstants.Network.DEFAULT_SSH_PORT.toString()
+                        peerPort = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString()
+                        webPort = CsqttConstants.Network.DEFAULT_SERVER_WEB_PORT.toString()
+                        portsEdited = false
+                    }
+                    scope.launch { settingsStore.saveManualPortsEnabled(action.enabled) }
                 }
                 is DeployAction.SshKeysModeChanged -> scope.launch {
                     settingsStore.saveSshKeysMode(action.enabled)
@@ -422,7 +446,12 @@ internal fun DeployTab(
                     if (host.isBlank()) {
                         scope.launch { snackbarHostState.showSnackbar("Сначала укажите IP сервера") }
                     } else {
-                        val effectiveWebPort = if (savedManualPorts) webPort.toIntOrNull() ?: 46002 else 46002
+                        val effectiveWebPort = resolveServerPorts(
+                            savedManualPorts,
+                            sshPort,
+                            peerPort,
+                            webPort,
+                        ).web
                         runCatching {
                             context.startActivity(
                                 Intent(Intent.ACTION_VIEW, "https://$host:$effectiveWebPort".toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

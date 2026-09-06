@@ -51,6 +51,28 @@ data class LogEntry(
 
 private val LOG_STICKERS = Regex("[\\p{So}\\p{Sk}\\uFE0F\\u200D]")
 private val EMPTY_LOG_TAG = Regex("\\[\\s*]")
+private val LOG_TIMESTAMP_PREFIX = Regex("^\\d{4}/\\d{2}/\\d{2}\\s\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s")
+
+internal fun displayVkHash(hash: String): String = hash.trim().let { value ->
+    if (value.length <= 10) value else value.take(10) + "…"
+}
+
+internal fun dnsProfileName(dns: String): String = when (dns.trim()) {
+    "77.88.8.8,77.88.8.1" -> "Yandex DNS"
+    "1.1.1.1,1.0.0.1" -> "Cloudflare DNS"
+    "8.8.8.8,8.8.4.4" -> "Google DNS"
+    "94.140.14.14,94.140.15.14" -> "AdGuard DNS"
+    "111.88.96.50,111.88.96.51" -> "Xbox DNS"
+    "83.220.169.155,212.109.195.93" -> "Comms DNS"
+    "95.182.120.241,37.230.192.51" -> "Geohide DNS"
+    "9.9.9.9,149.112.112.112" -> "Quad9 DNS"
+    "208.67.222.222,208.67.220.220" -> "OpenDNS"
+    "95.189.32.74,195.208.5.1" -> "Rostelecom DNS"
+    "45.90.28.181,45.90.30.181" -> "NextDNS"
+    "195.208.6.1,195.208.7.1" -> "BI.ZONE DNS"
+    "195.208.4.1,195.208.5.1" -> "НСДИ DNS"
+    else -> "Пользовательский DNS"
+}
 
 internal fun withoutLogStickers(message: String): String = message
     .replace(LOG_STICKERS) { symbol ->
@@ -72,15 +94,27 @@ object TunnelManager {
     private var processGeneration = 0L
     @Volatile
     private var processIdentity: ProcessIdentity? = null
+    @Volatile
+    private var nativeProcessPid: Int? = null
     private var readerJob: Job? = null
     private var restartJob: Job? = null
     private var panelRestartJob: Job? = null
     private var workerRecoveryJob: Job? = null
     private val transportRestartPending = AtomicBoolean(false)
     private val panelRestartPending = AtomicBoolean(false)
+    private val callRecoveryPending = AtomicBoolean(false)
     private val workerRecoveryPolicy = WorkerRecoveryPolicy()
+    private var crashRestartStreak = 0
     private const val WORKER_ZERO_CONFIRMATION_MS = 4_000L
+    private const val PANEL_SERVER_RESTART_DELAY_MS = 4_000L
     private const val STARTUP_DIAGNOSTIC_MS = 30_000L
+    // A process that lived shorter than this counts toward the crash-loop
+    // backoff; a longer-lived run resets it.
+    private const val CRASH_RESTART_STABLE_MS = 30_000L
+    private const val CRASH_RESTART_MAX_DELAY_MS = 60_000L
+    // Stats-path VPN start retry window: the START intent fires once from the
+    // Config event, then at most once per this interval until vpnReady.
+    private const val VPN_START_RETRY_MS = 10_000L
 
     private val startStopMutex = kotlinx.coroutines.sync.Mutex()
     private val lifecycleState = TunnelLifecycleState()
@@ -95,10 +129,30 @@ object TunnelManager {
     ) {
         val inputLock = Any()
         val readyWorkers = mutableSetOf<Int>()
+        val unavailableManualHashes = mutableSetOf<String>()
     }
+
+    private data class PendingLog(
+        val identity: ProcessIdentity?,
+        val key: String,
+        var message: String,
+        val priority: Int,
+        val isError: Boolean,
+        val level: LogLevel?,
+        var count: Int,
+    )
+
+    private const val LOG_UI_FLUSH_MS = 120L
+    private const val MAX_LOG_ENTRIES = 100
+    private const val MAX_PENDING_LOGS = 128
+    private const val MAX_LOG_MESSAGE_LENGTH = 1_024
+    private val pendingLogLock = Any()
+    private val pendingLogs = LinkedHashMap<String, PendingLog>()
+    private val pendingLogFlushScheduled = AtomicBoolean(false)
 
     @Volatile
     private var wrapAuthTimeoutCount = 0
+    private var lastVpnStartAttemptMs = 0L
     @Volatile
     var processStartedAtMs = 0L
     @Volatile
@@ -115,14 +169,20 @@ object TunnelManager {
 
     @Volatile
     var isLoggingEnabled = true
+        set(value) {
+            field = value
+            if (!value) clearLogs()
+        }
 
     val running = MutableStateFlow(false)
     val starting = MutableStateFlow(false)
+    val stopping = MutableStateFlow(false)
     val logs = mutableStateListOf<LogEntry>()
     val unreadErrorCount = MutableStateFlow(0)
     val config = MutableStateFlow<String?>(null)
     val stats = MutableStateFlow("Ожидание данных...")
     val activeWorkers = MutableStateFlow(0)
+    val autoPausedForWifi = MutableStateFlow(false)
     val vpnReady = MutableStateFlow(false)
     val uptimeSeconds = MutableStateFlow<Long?>(null)
     private var uptimeJob: Job? = null
@@ -164,6 +224,28 @@ object TunnelManager {
 
     fun getCurrentParams(): TunnelParams? = currentParams
 
+    fun currentNativeProcessId(): Int? {
+        nativeProcessPid
+            ?.takeIf { it > 0 && File("/proc/$it").exists() }
+            ?.let { return it }
+        val activeProcess = process ?: return null
+        if (!activeProcess.isAlive) return null
+        return processIdOf(activeProcess)
+    }
+
+    private fun processIdOf(activeProcess: Process): Int? {
+        return runCatching {
+            val field = activeProcess.javaClass.getDeclaredField("pid")
+            field.isAccessible = true
+            field.getInt(activeProcess).takeIf { it > 0 }
+        }.getOrNull() ?: Regex("pid=(\\d+)")
+            .find(activeProcess.toString())
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+    }
+
     init {
         scope.launch {
             running.collect { started ->
@@ -192,25 +274,23 @@ object TunnelManager {
     fun onPhysicalNetworkAvailable(context: Context) {
         if (!running.value) return
         if (pausedForNoNetwork.resume()) {
-            restartForNetworkSwap(context.applicationContext)
-        } else {
-            requestPathValidation("network_available")
+            val identity = processIdentity ?: return
+            activeScope.launch {
+                writeProcessCommand(identity, "RESUME", "network_resume_command_error")
+            }
         }
     }
 
-    fun requestPathValidation(reason: String) {
-        val identity = processIdentity ?: return
-        if (!running.value || !identity.process.isAlive) return
-        val safeReason = reason.lowercase()
-            .replace(Regex("[^a-z0-9_]+"), "_")
-            .trim('_')
-            .take(40)
-            .ifEmpty { "event" }
-        writeProcessCommand(identity, "PATH_VALIDATE:$safeReason", "path_validate_error")
-    }
-
-    fun onVpnInterfaceReady() {
+    fun onVpnInterfaceReady(dns: String? = null) {
         vpnReady.value = true
+        if (!dns.isNullOrBlank()) {
+            updateLog(
+                key = "vpn_dns_active_${dnsProfileName(dns)}",
+                message = "[SERVER] DNS применён: ${dnsProfileName(dns)} ✓",
+                priority = 32,
+                level = LogLevel.OK,
+            )
+        }
     }
 
     fun onVpnInterfaceStopped() {
@@ -227,16 +307,17 @@ object TunnelManager {
         }
     }
 
-    internal fun pauseForNoNetwork(reason: PhysicalNetworkPauseReason) {
+    internal fun suspendForNoNetwork(reason: PhysicalNetworkPauseReason) {
         if (!running.value || !pausedForNoNetwork.pause()) return
         val message = when (reason) {
             PhysicalNetworkPauseReason.AIRPLANE_MODE -> "[NET] Режим полёта · ожидание"
             PhysicalNetworkPauseReason.OFFLINE -> "[NET] Сеть отключена · ожидание"
         }
         updateLog("network_pause", message, 2, false, LogLevel.NET)
+        val identity = processIdentity ?: return
         activeScope.launch {
-            startStopMutex.withLock {
-                if (pausedForNoNetwork.isPaused()) terminateProcessLocked(processIdentity)
+            if (pausedForNoNetwork.isPaused()) {
+                writeProcessCommand(identity, "PAUSE", "network_pause_command_error")
             }
         }
     }
@@ -251,6 +332,9 @@ object TunnelManager {
     ): Boolean {
         if (!isCurrent(identity)) return true
         when (event) {
+            is TunnelEventParser.Event.Process -> {
+                nativeProcessPid = event.pid
+            }
             is TunnelEventParser.Event.Stats -> {
                 activeWorkers.value = event.active
                 if (workerRecoveryPolicy.observe(event.active)) {
@@ -260,7 +344,9 @@ object TunnelManager {
                 if (event.active > 0) {
                     wrapAuthTimeoutCount = 0
                     val currentConfig = config.value
-                    if (!vpnReady.value && currentConfig != null && currentConfig.startsWith("TUNCONF:")) {
+                    if (!vpnReady.value && currentConfig != null && currentConfig.startsWith("TUNCONF:") &&
+                        SystemClock.elapsedRealtime() - lastVpnStartAttemptMs >= VPN_START_RETRY_MS
+                    ) {
                         ensureVpnStarted(currentConfig, identity)
                     }
                 }
@@ -273,8 +359,9 @@ object TunnelManager {
                 activeWorkers.value = 0
                 scheduleWorkerZeroRecovery(identity)
             }
+            is TunnelEventParser.Event.CallUnavailable -> handleUnavailableVkCall(event, identity)
+            is TunnelEventParser.Event.NetworkSuspect -> verifyVkReachability(identity)
             is TunnelEventParser.Event.ServerRestart -> schedulePanelServerRestart(identity)
-            is TunnelEventParser.Event.PathHealth -> {}
             is TunnelEventParser.Event.Ready -> {
                 identity.startupProgress.streamReady()
                 if (event.worker == 0 || identity.readyWorkers.add(event.worker)) {
@@ -319,16 +406,114 @@ object TunnelManager {
         return true
     }
 
-    private fun ensureVpnStarted(configStr: String, identity: ProcessIdentity) {
+    private fun verifyVkReachability(identity: ProcessIdentity) {
+        if (!isCurrent(identity) || !running.value) return
+        val context = activeContext() ?: return
+        runCatching {
+            context.applicationContext.startService(
+                Intent(context.applicationContext, TunnelService::class.java).apply {
+                    action = CsqttConstants.General.ACTION_VERIFY_VK_REACHABILITY
+                },
+            )
+        }
+    }
+
+    private fun recoverUnavailableVkCall(hash: String) {
+        if (!running.value || !callRecoveryPending.compareAndSet(false, true)) return
+        val context = activeContext() ?: run {
+            callRecoveryPending.set(false)
+            return
+        }
+        runCatching {
+            context.applicationContext.startService(
+                Intent(context.applicationContext, TunnelService::class.java).apply {
+                    action = CsqttConstants.General.ACTION_RECOVER_VK_CALL
+                    putExtra(CsqttConstants.General.EXTRA_UNAVAILABLE_VK_HASH, hash)
+                },
+            )
+        }.onFailure {
+            callRecoveryPending.set(false)
+        }
+    }
+
+    private fun handleUnavailableVkCall(
+        event: TunnelEventParser.Event.CallUnavailable,
+        identity: ProcessIdentity,
+    ) {
+        val params = currentParams ?: return
+        val displayHash = displayVkHash(event.hash)
+        val reason = if (event.code == 951) "звонок не найден" else "код ${event.code}"
+        if (shouldReplaceUnavailableVkHash(params.vkHashMode)) {
+            updateLog(
+                key = "vk_hash_auto_replace_$displayHash",
+                message = "[VK] Хеш \"$displayHash\" устарел · ошибка ${event.code} — $reason · создаём новый ✓",
+                priority = 36,
+                level = LogLevel.OK,
+            )
+            recoverUnavailableVkCall(event.hash)
+            return
+        }
+
+        val isNewUnavailableHash = synchronized(identity.unavailableManualHashes) {
+            identity.unavailableManualHashes.add(event.hash)
+        }
+        if (!isNewUnavailableHash) return
+        updateProcessLog(
+            identity = identity,
+            key = "vk_hash_manual_invalid_$displayHash",
+            message = "[VK] Хеш \"$displayHash\" устарел · ошибка ${event.code} — $reason · инвалидируем и используем активные хеши ✓",
+            priority = 36,
+            level = LogLevel.OK,
+        )
+        activeScope.launch {
+            val store = activeSettingsStore ?: activeContext()?.let { SettingsStore(it) } ?: return@launch
+            activeSettingsStore = store
+            store.invalidateVkHash(event.hash)
+            val remaining = params.vkHashes
+                .split(Regex("[,\\s\\n]+"))
+                .map(String::trim)
+                .filter(String::isNotEmpty)
+                .distinct()
+                .count { hash ->
+                    synchronized(identity.unavailableManualHashes) {
+                        hash !in identity.unavailableManualHashes
+                    }
+                }
+            if (remaining == 0 && isCurrent(identity)) {
+                stop()
+            }
+        }
+    }
+
+    internal fun completeVkCallRecovery() {
+        callRecoveryPending.set(false)
+    }
+
+    private fun ensureVpnStarted(
+        configStr: String,
+        identity: ProcessIdentity,
+        forceRebuild: Boolean = false,
+    ) {
+        ensureVpnStartedMeasured(configStr, identity, forceRebuild)
+    }
+
+    private fun ensureVpnStartedMeasured(
+        configStr: String,
+        identity: ProcessIdentity,
+        forceRebuild: Boolean,
+    ) {
         if (!configStr.startsWith("TUNCONF:")) return
         val parts = configStr.removePrefix("TUNCONF:").split(":", limit = 3)
         val clientIp = parts.getOrNull(0) ?: "10.66.66.2"
         val dns = parts.getOrNull(1) ?: "1.1.1.1"
         activeContext()?.let { ctx ->
+            // Single choke point: both start paths share this attempt window.
+            lastVpnStartAttemptMs = SystemClock.elapsedRealtime()
             val vpnIntent = Intent(ctx, TunVpnService::class.java).apply {
                 action = "START"
                 putExtra("client_ip", clientIp)
                 putExtra("dns", dns)
+                putExtra("force_rebuild", forceRebuild)
             }
             try {
                 ctx.startService(vpnIntent)
@@ -367,7 +552,7 @@ object TunnelManager {
         panelRestartJob?.cancel()
         panelRestartJob = activeScope.launch {
             try {
-                delay(3_000L)
+                delay(PANEL_SERVER_RESTART_DELAY_MS)
                 if (!isCurrent(identity) || !running.value) return@launch
                 val context = activeContext() ?: return@launch
                 requestTransportRestart(
@@ -542,35 +727,87 @@ object TunnelManager {
         level: LogLevel?,
     ) {
         if (identity != null && !isCurrent(identity)) return
-        if (!isLoggingEnabled) return
-        val cleanMessage = withoutLogStickers(message)
+        if (!isLoggingEnabled && !TunnelLogPolicy.isAllowedWhenInactiveLogging(key, isError, level)) return
+        val cleanMessage = withoutLogStickers(message).take(MAX_LOG_MESSAGE_LENGTH)
         if (cleanMessage.isEmpty()) return
-        scope.launch(Dispatchers.Main) {
-            if (identity != null && !isCurrent(identity)) return@launch
-            val index = logs.indexOfFirst { it.key == key }
-            if (isError && index == -1) {
-                unreadErrorCount.value++
-            }
-            if (index != -1) {
-                val entry = logs[index]
-                if (entry.priority == priority) {
-                    logs[index] = entry.copy(
-                        count = entry.count + 1,
-                        message = cleanMessage,
-                        isError = isError,
-                        level = level,
-                    )
-                } else {
-                    logs.removeAt(index)
-                    insertSorted(LogEntry(key, cleanMessage, entry.count + 1, priority, isError, level))
+        val pendingKey = "${identity?.generation ?: 0L}:$key:$priority:$isError:${level?.name.orEmpty()}"
+        synchronized(pendingLogLock) {
+            val pending = pendingLogs[pendingKey]
+            if (pending == null) {
+                if (pendingLogs.size >= MAX_PENDING_LOGS) {
+                    pendingLogs.remove(pendingLogs.entries.first().key)
                 }
+                pendingLogs[pendingKey] = PendingLog(identity, key, cleanMessage, priority, isError, level, 1)
             } else {
-                insertSorted(LogEntry(key, cleanMessage, 1, priority, isError, level))
+                pending.message = cleanMessage
+                pending.count += 1
             }
+            scheduleLogFlushLocked()
+        }
+    }
 
-            while (logs.size > 100) {
-                logs.removeAt(0)
+    private fun scheduleLogFlushLocked() {
+        if (!pendingLogFlushScheduled.compareAndSet(false, true)) return
+        scope.launch(Dispatchers.Main) {
+            delay(LOG_UI_FLUSH_MS)
+            flushPendingLogs()
+        }
+    }
+
+    private fun flushPendingLogs() {
+        val batch = synchronized(pendingLogLock) {
+            val values = pendingLogs.values.toList()
+            pendingLogs.clear()
+            pendingLogFlushScheduled.set(false)
+            values
+        }
+        batch.forEach(::applyPendingLog)
+    }
+
+    private fun applyPendingLog(pending: PendingLog) {
+        val identity = pending.identity
+        if (identity != null && !isCurrent(identity)) return
+        val index = logs.indexOfFirst { it.key == pending.key }
+        if (pending.isError && index == -1) {
+            unreadErrorCount.value++
+        }
+        if (index != -1) {
+            val entry = logs[index]
+            if (entry.priority == pending.priority) {
+                logs[index] = entry.copy(
+                    count = entry.count + pending.count,
+                    message = pending.message,
+                    isError = pending.isError,
+                    level = pending.level,
+                )
+            } else {
+                logs.removeAt(index)
+                insertSorted(
+                    LogEntry(
+                        pending.key,
+                        pending.message,
+                        entry.count + pending.count,
+                        pending.priority,
+                        pending.isError,
+                        pending.level,
+                    )
+                )
             }
+        } else {
+            insertSorted(
+                LogEntry(
+                    pending.key,
+                    pending.message,
+                    pending.count,
+                    pending.priority,
+                    pending.isError,
+                    pending.level,
+                )
+            )
+        }
+
+        while (logs.size > MAX_LOG_ENTRIES) {
+            logs.removeAt(0)
         }
     }
 
@@ -597,6 +834,8 @@ object TunnelManager {
 
     fun start(context: Context, params: TunnelParams, isSwitching: Boolean = false) {
         val command = lifecycleCommand.incrementAndGet()
+        autoPausedForWifi.value = false
+        stopping.value = false
         
         if (!isSwitching) pausedForNoNetwork.reset()
         
@@ -612,6 +851,7 @@ object TunnelManager {
                     config.value = null
                     stats.value = "Ожидание данных..."
                     wrapAuthTimeoutCount = 0
+                    crashRestartStreak = 0
                     processStartedAtMs = 0L
                     currentParams = params
                     strongAppContext = appContext.applicationContext
@@ -634,6 +874,7 @@ object TunnelManager {
         lifecycleState.requestStop()
         stopUptimeTimer()
         running.value = false
+        stopping.value = false
         activeWorkers.value = 0
     }
 
@@ -691,7 +932,6 @@ object TunnelManager {
         if (params.allowHashRedistribution || jsHashMode) {
             cmd.add("--allow-hash-redistribution")
         }
-
         if (params.fingerprint.isNotEmpty()) {
             cmd.add("-fingerprint")
             cmd.add(params.fingerprint)
@@ -702,6 +942,8 @@ object TunnelManager {
         }
         cmd.add("-obfs")
         cmd.add(params.obfsMode)
+        cmd.add("-turn-transport")
+        cmd.add(params.turnTransport)
         cmd.add("-vk-auth-mode")
         cmd.add(params.vkAuthMode)
         cmd.add("-device-id")
@@ -724,7 +966,6 @@ object TunnelManager {
         pb.redirectErrorStream(true)
         pb.environment()["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
         pb.environment()[CsqttConstants.Tunnel.PROCESS_ENV_EVENTS] = "1"
-        pb.environment()["TOKIO_WORKER_THREADS"] = WorkerCountPolicy.runtimeThreadsForWorkers(totalWorkers).toString()
         pb.environment()["RAYON_NUM_THREADS"] = "2"
 
         val ticket = lifecycleState.reserveProcess(epoch, process == null) ?: return
@@ -763,9 +1004,11 @@ object TunnelManager {
             startedProcess,
             processGeneration,
             ticket,
-            if (jsHashMode) 9_000L else 2_000L,
+            3_500L,
         )
         process = startedProcess
+        callRecoveryPending.set(false)
+        nativeProcessPid = processIdOf(startedProcess)
         processIdentity = identity
         running.value = true
         startUptimeTimer()
@@ -820,8 +1063,34 @@ object TunnelManager {
                 reader.forEachLine { line ->
                     if (!isCurrent(identity)) return@forEachLine
 
-                    val msgPrefixReplaced = line.replace(Regex("^\\d{4}/\\d{2}/\\d{2}\\s\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s"), "")
-                    val lineTrim = msgPrefixReplaced.trim()
+                    // The timestamp prefix always starts with "YYYY/", so two
+                    // character checks skip the regex for non-timestamped lines.
+                    val stripped =
+                        if (line.length > 19 && line[0].isDigit() && line[4] == '/') {
+                            line.replace(LOG_TIMESTAMP_PREFIX, "")
+                        } else {
+                            line
+                        }
+                    val lineTrim = stripped.trim()
+
+                    // Structured events are the common case under traffic:
+                    // one startsWith check routes them out before all the
+                    // substring scans below.
+                    val event = TunnelEventParser.parse(lineTrim)
+                    if (event != null && handleTunnelEvent(event, identity)) {
+                        return@forEachLine
+                    }
+
+                    if (!isLoggingEnabled &&
+                        !lineTrim.startsWith("CAPTCHA_SOLVE|") &&
+                        !lineTrim.contains("FATAL_")
+                    ) {
+                        return@forEachLine
+                    }
+
+                    if (TunnelLogPolicy.isInternalRecovery(lineTrim)) {
+                        return@forEachLine
+                    }
 
                     if (
                         lineTrim.contains("[ФАТАЛ]", true) ||
@@ -833,42 +1102,32 @@ object TunnelManager {
                         lastDiagnostic = lineTrim.take(240)
                     }
 
-                    val event = TunnelEventParser.parse(lineTrim)
-                    if (event != null && handleTunnelEvent(event, identity)) {
+                    if (lineTrim.contains("WRAP_AUTH_TIMEOUT", true)) {
+                        // WRAP handshake timeouts are recoverable; they must not
+                        // fall through to the fatal-auth stop below.
+                        if (activeWorkers.value > 0) {
+                            wrapAuthTimeoutCount = 0
+                            updateProcessLog(
+                                identity,
+                                "wrap_timeout_recovered",
+                                "[WRAP] Один поток не прошёл handshake, активных=${activeWorkers.value}; повторяем",
+                                50,
+                                true
+                            )
+                        } else {
+                            wrapAuthTimeoutCount++
+                            updateProcessLog(
+                                identity,
+                                "wrap_timeout_wait",
+                                "[WRAP] Handshake не подтвердился, проверяем пароль/сеть ($wrapAuthTimeoutCount)",
+                                50,
+                                true
+                            )
+                        }
                         return@forEachLine
                     }
-
-                    if (TunnelLogPolicy.isInternalRecovery(lineTrim)) {
-                        return@forEachLine
-                    }
-
-                    val isError = lineTrim.contains("Ошибка", true) || lineTrim.contains("error", true) || lineTrim.contains("FAIL", true) || lineTrim.contains("timeout", true) || lineTrim.contains("refused", true) || lineTrim.contains("FATAL_AUTH", true)
 
                     if (lineTrim.contains("FATAL_AUTH")) {
-                        val isWrapHandshakeTimeout = lineTrim.contains("WRAP_AUTH_TIMEOUT", true)
-                        if (isWrapHandshakeTimeout) {
-                            if (activeWorkers.value > 0) {
-                                wrapAuthTimeoutCount = 0
-                                updateProcessLog(
-                                    identity,
-                                    "wrap_timeout_recovered",
-                                    "[WRAP] Один поток не прошёл handshake, активных=${activeWorkers.value}; повторяем",
-                                    50,
-                                    true
-                                )
-                            } else {
-                                wrapAuthTimeoutCount++
-                                updateProcessLog(
-                                    identity,
-                                    "wrap_timeout_wait",
-                                    "[WRAP] Handshake не подтвердился, проверяем пароль/сеть ($wrapAuthTimeoutCount)",
-                                    50,
-                                    true
-                                )
-                            }
-                            return@forEachLine
-                        }
-
                         val reason = when {
                             lineTrim.contains("неверный пароль") -> "Неверный пароль подключения"
                             lineTrim.contains("истёк") -> "Срок действия пароля истёк"
@@ -879,26 +1138,19 @@ object TunnelManager {
                         return@forEachLine
                     }
 
-                    if (lineTrim.contains("WRAP_AUTH_TIMEOUT", true)) {
-                        if (activeWorkers.value > 0) {
-                            wrapAuthTimeoutCount = 0
-                            updateProcessLog(
-                                identity,
-                                "wrap_timeout_recovered",
-                                "[WRAP] Один поток не прошёл handshake, активных=${activeWorkers.value}; повторяем",
-                                    50,
-                                    true
-                            )
-                        } else {
-                            wrapAuthTimeoutCount++
-                            updateProcessLog(
-                                identity,
-                                "wrap_timeout_wait",
-                                "[WRAP] Handshake не подтвердился, проверяем пароль/сеть ($wrapAuthTimeoutCount)",
-                                    50,
-                                    true
-                            )
-                        }
+                    if (lineTrim.contains("FATAL_PROTOCOL")) {
+                        handleCriticalError(
+                            "🔁 Клиент и сервер используют разные версии протокола. Выполните деплой из этой версии приложения. Воркеры остановлены.",
+                            identity,
+                        )
+                        return@forEachLine
+                    }
+
+                    if (lineTrim.contains("FATAL_HANDSHAKE")) {
+                        handleCriticalError(
+                            "🔐 Сервер не подтвердил подключение. Проверьте пароль туннеля и совместимость клиента с сервером. Воркеры остановлены.",
+                            identity,
+                        )
                         return@forEachLine
                     }
 
@@ -931,6 +1183,10 @@ object TunnelManager {
                         }
                         return@forEachLine
                     }
+
+                    // Computed this late so early-returning lines (events,
+                    // recovery noise, WRAP/CAPTCHA) skip the six scans.
+                    val isError = lineTrim.contains("Ошибка", true) || lineTrim.contains("error", true) || lineTrim.contains("FAIL", true) || lineTrim.contains("timeout", true) || lineTrim.contains("refused", true) || lineTrim.contains("FATAL_", true)
 
                     when {
                         lineTrim.contains("[КАПЧА] AUTO:") -> {
@@ -995,8 +1251,6 @@ object TunnelManager {
                             updateProcessLog(identity, "vk_js_creator_left", "[VK JS] Владелец вышел из звонка ✓", 19, false, LogLevel.OK)
                         lineTrim.startsWith("[VK JS] Звонки завершены") ->
                             updateProcessLog(identity, "vk_js_call_finished", "[VK JS] Звонок завершён ✓", 19, false, LogLevel.OK)
-                        lineTrim.startsWith("[VK JS] Авторизация аккаунта") ->
-                            updateProcessLog(identity, "vk_js_account_auth", "[VK JS] Авторизация аккаунта · один звонок · максимум 162 потока", 15, false, LogLevel.OK)
                         lineTrim.startsWith("[VK JS] Создатель удерживает звонок") ->
                             updateProcessLog(identity, "vk_js_creator_held", "[VK JS] Владелец удерживает звонок до отключения", 18, false, LogLevel.OK)
 
@@ -1015,15 +1269,30 @@ object TunnelManager {
                         lineTrim.contains("[WRAP]") -> {
                             updateProcessLog(identity, "wrap_status", "[WRAP] Ключ вычислен ✓", 10, false, LogLevel.OK)
                         }
+                        lineTrim.startsWith("[ПОТОКИ]") -> {
+                            val text = lineTrim.substringAfter("[ПОТОКИ]").trim()
+                            val isRepair = text.contains("не пришёл", true) ||
+                                text.contains("частично", true) ||
+                                text.contains("Перезапуск", true)
+                            val (stableKey, priority) = when {
+                                text.startsWith("Отправлен ping", true) -> "stream_probe_ping" to 56
+                                text.startsWith("ACK получен", true) || text.startsWith("Все активные", true) -> "stream_probe_ack" to 57
+                                text.contains("ChannelBind", true) -> "stream_probe_rebind" to 58
+                                text.contains("проверяю", true) -> "stream_probe_all" to 58
+                                text.contains("Перезапуск", true) -> "stream_probe_restart" to 59
+                                else -> "stream_probe_${text.take(24).hashCode()}" to 59
+                            }
+                            updateProcessLog(identity, stableKey, "[ПОТОКИ] $text", priority, isRepair, if (isRepair) LogLevel.ERR else LogLevel.LOG)
+                        }
                         lineTrim.contains("[TURN]") -> {
                             val text = lineTrim.substringAfter("[TURN]").trim()
                             val turnError = TunnelLogPolicy.isTurnStreamFailure(lineTrim) || isError
                             val (stableKey, priority) = when {
+                                turnError -> "turn_error_${text.hashCode()}" to 99
                                 text.contains("CreatePermission", true) -> "turn_permission_status" to 52
                                 text.contains("ChannelBind", true) || text.contains("Канал", true) -> "turn_channel_status" to 53
                                 text.contains("готова к передаче", true) -> "turn_ready_status" to 54
                                 text.contains("Refresh", true) -> "turn_refresh_status" to 55
-                                turnError -> "turn_${text.take(24).hashCode()}" to 99
                                 else -> null to 0
                             }
                             if (stableKey != null) {
@@ -1066,6 +1335,7 @@ object TunnelManager {
                         val shouldRestart = lifecycleState.processEnded(identity.ticket)
                         process = null
                         processIdentity = null
+                        nativeProcessPid = null
                         activeWorkers.value = 0
                         resetWorkerRecoveryState()
                         if (readerJob === coroutineContext[Job]) readerJob = null
@@ -1106,7 +1376,18 @@ object TunnelManager {
                                 50,
                                 true,
                             )
-                            scheduleRestartLocked(restartContext, restartParams, identity.ticket.epoch, 2_000)
+                            // Exponential backoff: a binary that dies instantly
+                            // must not loop the whole start sequence every 2s.
+                            val uptimeMs = processStartedAtMs
+                                .takeIf { it > 0 }
+                                ?.let { SystemClock.elapsedRealtime() - it }
+                                ?: Long.MAX_VALUE
+                            crashRestartStreak =
+                                if (uptimeMs >= CRASH_RESTART_STABLE_MS) 0 else crashRestartStreak + 1
+                            val backoffShift = crashRestartStreak.coerceIn(1, 6) - 1
+                            val restartDelayMs = (2_000L shl backoffShift)
+                                .coerceAtMost(CRASH_RESTART_MAX_DELAY_MS)
+                            scheduleRestartLocked(restartContext, restartParams, identity.ticket.epoch, restartDelayMs)
                         } else if (!lifecycleState.isDesiredRunning()) {
                             running.value = false
                         }
@@ -1151,11 +1432,14 @@ object TunnelManager {
         val nextGen = store.reserveConnectionGeneration(proposed = proposed)
         return copy(
             generationId = nextGen,
-            sessionSalt = java.util.UUID.randomUUID().toString().replace("-", ""),
+            sessionSalt = newTunnelSessionId(),
         )
     }
 
-    private fun terminateProcessLocked(identity: ProcessIdentity?) {
+    private fun terminateProcessLocked(
+        identity: ProcessIdentity?,
+        finishVkCalls: Boolean = false,
+    ) {
         if (identity == null) {
             activeWorkers.value = 0
             return
@@ -1166,11 +1450,12 @@ object TunnelManager {
         if (attached) {
             process = null
             processIdentity = null
+            nativeProcessPid = null
             stopUptimeTimer()
             resetWorkerRecoveryState()
         }
         lifecycleState.releaseReservation(identity.ticket)
-        terminateExactProcess(targetProcess, identity.shutdownGraceMs)
+        terminateExactProcess(targetProcess, identity.shutdownGraceMs, finishVkCalls)
         logReader?.cancel()
         if (readerJob === logReader) {
             readerJob = null
@@ -1178,36 +1463,70 @@ object TunnelManager {
         if (attached) activeWorkers.value = 0
     }
 
-    private fun terminateExactProcess(targetProcess: Process, shutdownGraceMs: Long) {
+    private fun terminateExactProcess(
+        targetProcess: Process,
+        shutdownGraceMs: Long,
+        finishVkCalls: Boolean = false,
+    ) {
+        val forceWindowMs = minOf(300L, shutdownGraceMs)
+        val gracefulWindowMs = (shutdownGraceMs - forceWindowMs).coerceAtLeast(0L)
         try {
-            targetProcess.outputStream.write("STOP\n".toByteArray())
+            val command = if (finishVkCalls) "FINISH_VK_CALLS\nSTOP\n" else "STOP\n"
+            targetProcess.outputStream.write(command.toByteArray())
             targetProcess.outputStream.flush()
         } catch (_: Exception) {}
         try {
-            targetProcess.waitFor(shutdownGraceMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            targetProcess.waitFor(gracefulWindowMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         } catch (_: Exception) {}
         if (targetProcess.isAlive) {
             try { targetProcess.destroy() } catch (_: Exception) {}
-            try { targetProcess.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
+            try { targetProcess.waitFor(forceWindowMs, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
         }
         if (targetProcess.isAlive) {
             try { targetProcess.destroyForcibly() } catch (_: Exception) {}
-            try { targetProcess.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
         }
     }
 
-    fun stop() {
+    fun stop(finishVkCalls: Boolean = false) {
         val command = lifecycleCommand.incrementAndGet()
+        stopping.value = true
         scope.launch {
             startStopMutex.withLock {
                 if (lifecycleCommand.get() != command) return@withLock
-                stopLocked(processIdentity)
+                stopLocked(processIdentity, finishVkCalls)
             }
         }
     }
 
-    private fun stopLocked(identity: ProcessIdentity?) {
+    suspend fun pauseForWifi() {
+        lifecycleCommand.incrementAndGet()
+        startStopMutex.withLock {
+            autoPausedForWifi.value = true
+            stopLocked(processIdentity, preserveWifiAutoPause = true)
+            starting.value = false
+            stats.value = "Ожидание. Автопауза при Wi-Fi"
+            updateLog(
+                "wifi_auto_pause",
+                "Ожидание. Автопауза при Wi-Fi",
+                2,
+                false,
+                LogLevel.NET,
+            )
+        }
+    }
+
+    fun leaveWifiAutoPause() {
+        autoPausedForWifi.value = false
+    }
+
+    private fun stopLocked(
+        identity: ProcessIdentity?,
+        finishVkCalls: Boolean = false,
+        preserveWifiAutoPause: Boolean = false,
+    ) {
+        stopping.value = true
         lifecycleState.requestStop()
+        if (!preserveWifiAutoPause) autoPausedForWifi.value = false
         pausedForNoNetwork.reset()
         vpnReady.value = false
         restartJob?.cancel()
@@ -1220,9 +1539,11 @@ object TunnelManager {
             val stopIntent = Intent(ctx, TunVpnService::class.java).apply { action = "STOP" }
             try { ctx.startService(stopIntent) } catch (_: Exception) {}
         }
-        terminateProcessLocked(identity)
+        terminateProcessLocked(identity, finishVkCalls)
         running.value = false
+        stopping.value = false
         activeWorkers.value = 0
+        nativeProcessPid = null
         currentParams = null
         activeSettingsStore = null
         ManlCaptchaWebViewManager.cancelCaptcha()
@@ -1350,19 +1671,23 @@ object TunnelManager {
         errorKey: String,
     ): Boolean {
         if (!isCurrent(identity) || !identity.process.isAlive) return false
-        try {
+        return try {
             synchronized(identity.inputLock) {
                 identity.process.outputStream.write("$command\n".toByteArray(Charsets.UTF_8))
                 identity.process.outputStream.flush()
             }
-            return true
+            true
         } catch (e: Exception) {
             updateProcessLog(identity, errorKey, "Ошибка записи в Rust: ${e.message}", 200, true)
-            return false
+            false
         }
     }
 
     fun clearLogs() {
+        synchronized(pendingLogLock) {
+            pendingLogs.clear()
+        }
+        unreadErrorCount.value = 0
         scope.launch(Dispatchers.Main) {
             logs.clear()
         }
@@ -1401,6 +1726,7 @@ data class TunnelParams(
     val fingerprint: String = "firefox",
     val clientIds: String = "8202606,6287487",
     val obfsMode: String = CsqttConstants.Tunnel.DEFAULT_OBFS_MODE,
+    val turnTransport: String = CsqttConstants.Tunnel.DEFAULT_TURN_TRANSPORT,
     val generationId: Long = 0,
     val sessionSalt: String = "",
     val allowHashRedistribution: Boolean = false,
